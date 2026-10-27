@@ -1,0 +1,51 @@
+# --- Game copies and game data (never commit: large and copyrighted) ---
+/cwgame*/
+/aim1game*/
+/aim1n[0-9][0-9]/
+*.exe
+*.pak
+*.bik
+*.sav
+*.bin
+*.tm
+*.TM
+*.dds
+# the mod's own replacement textures (packaged by tools/make_*.py)
+!tr/**/*.dds
+!tr/**/*.tm
+!tr/**/*.TM
+
+# --- Toolchain (downloaded by the setup script) ---
+/ext/
+
+# --- Reverse-engineering material from the game executables (keep private) ---
+/re/
+/ghidra_proj/
+exe_strings*.txt
+net_strings.txt
+db_schema.txt
+
+# --- Build output and packages ---
+/build/
+/dist/
+*.map
+*.o
+
+# --- Logs, crash reports, screenshots, scratch ---
+/crash logs/
+/tmp/
+*.log
+*.dmp
+rt_dump_*.bmp
+rr_cmd.txt
+rr_cmd.run
+__pycache__/
+*.pyc
+
+# --- Local settings ---
+*.local.ini
+
+# --- Local binaries ---
+*.dll
+
+*.zip
