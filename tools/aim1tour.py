@@ -34,26 +34,34 @@ def wait_log(g, text, since, timeout):
 
 
 def find_transfer(png):
-    """the jump page's "make the transfer" link: the lowest red text line in the text panel"""
+    """the jump page's "make the transfer" link: the last text line in the text panel, left of the sector's
+    picture (which has red ground of its own)"""
     im = Image.open(png).convert('RGB')
     s = 1920 / im.width
     px = im.load()
     rows = []
     for y in range(int(140 / s), int(900 / s)):
         n, x0 = 0, None
-        for x in range(int(480 / s), int(1420 / s)):
+        for x in range(int(490 / s), int(1200 / s)):
             r, g, b = px[x, y]
-            # red (192, 98, 91), or lighter once the link was hovered / used (218, 158, 153)
-            if r > 140 and r - g > 40 and r - b > 40 and abs(g - b) < 30:
+            # red (192, 98, 91), lighter once hovered / used (218, 158, 153), or white like the text
+            if (r > 140 and r - g > 40 and r - b > 40 and abs(g - b) < 30) or min(r, g, b) > 190:
                 n += 1
                 if x0 is None:
                     x0 = x
         if n >= 3:
             rows.append((y, x0))
-    if not rows:
+    lines = []
+    for y, x0 in rows:
+        if lines and y - lines[-1][-1][0] <= 2:
+            lines[-1].append((y, x0))
+        else:
+            lines.append([(y, x0)])
+    if not lines:
         return None
-    y, x0 = rows[-1]
-    return (int((x0 + 20) * s), int(y * s))
+    last = lines[-1]
+    y = (last[0][0] + last[-1][0]) // 2
+    return (int((min(x for _, x in last) + 20) * s), int(y * s))
 
 
 def sector():
@@ -100,8 +108,8 @@ def revive(dead, since):
     if not wait_log(S.G[other], "%s's mechmind is lying at" % NAME[dead], since[other], 40):
         print('  %s is down and %s found no mechmind' % (dead, other))
         return False
-    h.send(S.G[other], ['pickmind', 'sleep 2500'], timeout=60)
-    h.send(S.G[other], ['enter ' + base, 'sleep 5000'], timeout=60)
+    # into a base at once: the mechmind lies where its owner was shot down, among those NPCs
+    h.send(S.G[other], ['pickmind', 'sleep 500', 'enter ' + base, 'sleep 5000'], timeout=60)
     if dead == 'host':
         ok = wait_log(S.G['host'], 'back in our own world', since['host'], 20)
         h.send(S.G['host'], ['sleep 2000', 'click %d %d' % FLY_OUT, 'sleep 4000'], timeout=60)
@@ -124,6 +132,10 @@ def quest_hash(who):
 
 def quests_same():
     """both players' quest logs (tasks, journal, flags, timers) are the same - give the sync a few s"""
+    for who in S.G:                       # qldump answers in flight only (and the logs are merged there)
+        if not S.leave_base(who):
+            print('  %s is stuck in a base' % who)
+            return False
     for _ in range(6):
         a, b = quest_hash('host'), quest_hash('guest')
         if a and a == b:

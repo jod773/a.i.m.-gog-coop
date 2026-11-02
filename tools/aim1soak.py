@@ -118,6 +118,9 @@ def base_visit(who):
         acts = ['click %d %d' % link, 'sleep 2500']
     h.send(g, acts + ['click 230 875', 'sleep 9000'])
     out = '' if leave_base(who) else ' - STILL IN THE BASE'
+    # away from the gate: an idle glider drifts back into it, and a gate that denies access (the bunker in
+    # sector 2) opens its screen again
+    h.send(g, ['hold 0x11 2500'], timeout=30)
     return '%s visited %s%s%s' % (who, b, ' (accepted a mission)' if link else '', out)
 
 
