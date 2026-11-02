@@ -1,7 +1,7 @@
 // Text drawn over the game's picture (the chat line being typed, notices while the game draws no HUD,
 // the version in the main menu), through the game's own
 // Direct3D 8 device just before it presents a frame. The font is drawn once by GDI into a
-// texture (ASCII 32-126 and cp1251 192-255, 16 x 14 cells).
+// texture (ASCII 32-126 and cp1251 192-255, 16 cells a row).
 #include "util.h"
 #include <string.h>
 
@@ -13,9 +13,9 @@ enum { D_GETBACKBUFFER = 16, D_CREATETEXTURE = 20, D_BEGINSCENE = 34, D_ENDSCENE
        D_GETVIEWPORT = 41, D_SETRS = 50, D_GETRS = 51, D_GETTEXTURE = 60, D_SETTEXTURE = 61, D_GETTSS = 62,
        D_SETTSS = 63, D_DRAWUP = 72, D_SETVS = 76, D_GETVS = 77 };
 
-#define CW 16
+#define CW 24                         // wide enough for 'm' / 'W' (16 cut them: "teammate" read "tearrmate")
 #define CH 28
-#define TEXW 256
+#define TEXW 512
 #define TEXH 512                      // 16 x 18 cells
 static void *g_font, *g_font_dev;
 static unsigned char g_adv[256];
