@@ -35,6 +35,9 @@
 #define TYPE_THING        0x15                       // CTheThing: things lying around to pick up
 #define THING_KIND        0x278
 #define KIND_MECHMIND     0x101
+// byte: only the player picks it up (else every glider nearby does, NPCs too) and it never expires
+// (CTheThing::Run deletes other things 1200 s old and over 1000 away from the camera)
+#define THING_PLAYER_ONLY 0x410
 // the hold's goods (CGarbage at mechanoid +0x34, CGarbage::AddGoods 0x409740): +4 count, +8 entries of
 // 0x2c (int kind, name32, +0x24 count); a picked-up mechmind is an entry named after its pilot
 #define MO_GOODS          0x34
@@ -167,6 +170,9 @@ static void link_mechmind(fallen *f)
     }
     if (!best) return;
     f->thing = best;
+    // A passing NPC (or a teammate's puppet) picked it up within seconds, into a hold nobody can
+    // deliver from: the dead player could not be brought back. Ours to take (local player) only.
+    best[THING_PLAYER_ONLY] = 1;
     memcpy(f->pos, best + OBJ_POS, sizeof f->pos);
     mlog("respawn: %s's mechmind is lying at %.0f %.0f %.0f", f->name, f->pos[0], f->pos[1], f->pos[2]);
 }
