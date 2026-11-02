@@ -23,7 +23,9 @@ typedef int (WINAPI *bink_copy_fn)(void *, void *, int, unsigned, unsigned, unsi
 static int (THISCALL *o_showframe)(uint8_t *);
 static bink_doframe_fn p_doframe;
 static bink_copy_fn p_copy;
-static void *g_tex, *g_tex_dev;
+static int (WINAPI *p_volume)(void *, unsigned, int);
+static int g_mute;                      // the test harness plays videos silently (sound off stalls Bink's clock)
+static void *g_tex, *g_tex_dev, *g_last_bink;
 static unsigned g_tw, g_th;
 
 static int show(uint8_t *pl)
@@ -33,6 +35,10 @@ static int show(uint8_t *pl)
     if (!dev || !bink || !p_doframe || !p_copy) return 0;
     unsigned w = bink[0], h = bink[1];
     if (!w || !h || w > 4096 || h > 4096) return 0;
+    if (bink != g_last_bink) {
+        g_last_bink = bink;
+        if (g_mute && p_volume) p_volume(bink, 0, 0);
+    }
     if (!g_tex || g_tex_dev != dev || g_tw != w || g_th != h) {
         if (g_tex && g_tex_dev == dev) FN(g_tex, 2, ULONG (WINAPI *)(void *))(g_tex);
         g_tex = NULL;
@@ -44,7 +50,12 @@ static int show(uint8_t *pl)
     }
     p_doframe(bink);
     struct { int pitch; void *bits; } lr;
-    if (FN(g_tex, 16, HR (WINAPI *)(void *, UINT, void *, const RECT *, DWORD))(g_tex, 0, &lr, NULL, 0) < 0) return 1;
+    HR hr = FN(g_tex, 16, HR (WINAPI *)(void *, UINT, void *, const RECT *, DWORD))(g_tex, 0, &lr, NULL, 0);
+    static int nfail;
+    if (hr < 0) {
+        if (nfail++ < 3) mlog("video: texture lock failed (%08lx)", hr);
+        return 1;
+    }
     p_copy(bink, lr.bits, lr.pitch, h, 0, 0, 3 | 0x80000000);      // BINKSURFACE32, BINKCOPYALL
     FN(g_tex, 17, HR (WINAPI *)(void *, UINT))(g_tex, 0);
 
@@ -93,7 +104,10 @@ static int show(uint8_t *pl)
     FN(dev, D_SETTEXTURE, HR (WINAPI *)(void *, DWORD, void *))(dev, 0, old_tex);
     if (old_tex) FN(old_tex, 2, ULONG (WINAPI *)(void *))(old_tex);
     FN(dev, D_SETVIEWPORT, HR (WINAPI *)(void *, const void *))(dev, &vp);
-    FN(dev, D_PRESENT, HR (WINAPI *)(void *, const RECT *, const RECT *, HWND, const void *))(dev, NULL, NULL, NULL, NULL);
+    hr = FN(dev, D_PRESENT, HR (WINAPI *)(void *, const RECT *, const RECT *, HWND, const void *))(dev, NULL, NULL, NULL, NULL);
+    static int nframes, npfail;
+    if (hr < 0 && npfail++ < 3) mlog("video: Present failed (%08lx)", hr);
+    if (++nframes % 500 == 0) mlog("video: %d frames shown", nframes);
     return 1;
 }
 
@@ -111,6 +125,8 @@ void aim1_video_install(void)
     if (!b) b = LoadLibraryA("binkw32.dll");
     p_doframe = b ? (bink_doframe_fn)GetProcAddress(b, "_BinkDoFrame@4") : NULL;
     p_copy = b ? (bink_copy_fn)GetProcAddress(b, "_BinkCopyToBuffer@28") : NULL;
+    p_volume = b ? (int (WINAPI *)(void *, unsigned, int))GetProcAddress(b, "_BinkSetVolume@12") : NULL;
+    g_mute = GetPrivateProfileIntA("Dev", "Harness", 0, g_ini);
     static const uint8_t k[] = {0x55, 0x56, 0x8b, 0xf1, 0x8b, 0x46, 0x04};
     if (p_doframe && p_copy) o_showframe = hook_jmp(0x4a8ac0, k, sizeof k, (void *)h_showframe);
     mlog("video: Direct3D frames %s", o_showframe ? "on" : "unavailable");

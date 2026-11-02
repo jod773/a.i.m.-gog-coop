@@ -1065,10 +1065,22 @@ static BYTE *scaled_copy(dev8 *d, const BYTE *v, UINT n, UINT stride)
     }
     return c;
 }
-static void restore_streams(dev8 *d)       // the UP draws unbind stream 0 and the indices
+// The UP draws unbind stream 0 and the indices: put back what was bound before. Held by a reference
+// meanwhile - the game may have released those buffers already (the menu's, before a video plays), and
+// the unbinding then freed them: binding the remembered pointer again made the next draw crash.
+typedef struct { IDirect3DVertexBuffer9 *vb; UINT off, st; IDirect3DIndexBuffer9 *ib; } streams;
+static void keep_streams(dev8 *d, streams *s)
 {
-    IDirect3DDevice9_SetStreamSource(d->r, 0, d->vb0 ? (IDirect3DVertexBuffer9 *)d->vb0->r : NULL, 0, d->stride0);
-    IDirect3DDevice9_SetIndices(d->r, d->ib ? (IDirect3DIndexBuffer9 *)d->ib->r : NULL);
+    s->vb = NULL; s->ib = NULL; s->off = s->st = 0;
+    IDirect3DDevice9_GetStreamSource(d->r, 0, &s->vb, &s->off, &s->st);
+    IDirect3DDevice9_GetIndices(d->r, &s->ib);
+}
+static void restore_streams(dev8 *d, streams *s)
+{
+    IDirect3DDevice9_SetStreamSource(d->r, 0, s->vb, s->off, s->st);
+    IDirect3DDevice9_SetIndices(d->r, s->ib);
+    if (s->vb) IDirect3DVertexBuffer9_Release(s->vb);
+    if (s->ib) IDirect3DIndexBuffer9_Release(s->ib);
 }
 static UINT prim_verts(D3DPRIMITIVETYPE t, UINT n)
 {
@@ -1094,9 +1106,11 @@ static HRESULT WINAPI d_DrawPrimitive_(dev8 *d, D3DPRIMITIVETYPE t, UINT s, UINT
         UINT nv = prim_verts(t, n);
         if ((s + nv) * d->stride0 <= d->vb0->size) {
             BYTE *c = scaled_copy(d, d->vb0->mirror + s * d->stride0, nv, d->stride0);
+            streams k;
+            keep_streams(d, &k);
             HRESULT hr = IDirect3DDevice9_DrawPrimitiveUP(D9, t, n, c, d->stride0);
             free(c);
-            restore_streams(d);
+            restore_streams(d, &k);
             return hr;
         }
     }
@@ -1117,10 +1131,12 @@ static HRESULT WINAPI d_DrawIndexedPrimitive(dev8 *d, D3DPRIMITIVETYPE t, UINT m
                 v -= mi;
                 if (isz == 4) ((DWORD *)ix)[i] = v; else ((WORD *)ix)[i] = (WORD)v;
             }
+            streams k;
+            keep_streams(d, &k);
             HRESULT hr = IDirect3DDevice9_DrawIndexedPrimitiveUP(D9, t, 0, nv, pc, ix, id.Format, c, d->stride0);
             free(c);
             free(ix);
-            restore_streams(d);
+            restore_streams(d, &k);
             return hr;
         }
     }
@@ -1134,31 +1150,35 @@ static HRESULT WINAPI d_DrawIndexedPrimitive(dev8 *d, D3DPRIMITIVETYPE t, UINT m
 static HRESULT WINAPI d_DrawPrimitiveUP(dev8 *d, D3DPRIMITIVETYPE t, UINT pc, const void *v, UINT st)
 {
     logdraw(d, "DPUP", t, pc);
+    streams k;
+    keep_streams(d, &k);
     if (rhw_scaled(d)) {
         BYTE *c = scaled_copy(d, v, prim_verts(t, pc), st);
         HRESULT hr = IDirect3DDevice9_DrawPrimitiveUP(D9, t, pc, c, st);
         free(c);
-        restore_streams(d);
+        restore_streams(d, &k);
         return hr;
     }
     HRESULT hr0 = chk("DrawPrimitiveUP", IDirect3DDevice9_DrawPrimitiveUP(D9, t, pc, v, st), pc, st);
     if (SUCCEEDED(hr0) && LIT(d)) { IDirect3DDevice9_DrawPrimitiveUP(D9, t, pc, v, st); d9light_end(d->r); }
-    restore_streams(d);
+    restore_streams(d, &k);
     return hr0;
 }
 static HRESULT WINAPI d_DrawIndexedPrimitiveUP(dev8 *d, D3DPRIMITIVETYPE t, UINT mi, UINT nv, UINT pc, const void *ix, D3DFORMAT f, const void *v, UINT st)
 {
     logdraw(d, "DIPUP", t, pc);
+    streams k;
+    keep_streams(d, &k);
     if (rhw_scaled(d)) {
         BYTE *c = scaled_copy(d, v, mi + nv, st);
         HRESULT hr = IDirect3DDevice9_DrawIndexedPrimitiveUP(D9, t, mi, nv, pc, ix, f, c, st);
         free(c);
-        restore_streams(d);
+        restore_streams(d, &k);
         return hr;
     }
     HRESULT hr0 = chk("DrawIndexedPrimitiveUP", IDirect3DDevice9_DrawIndexedPrimitiveUP(D9, t, mi, nv, pc, ix, f, v, st), nv, pc);
     if (SUCCEEDED(hr0) && LIT(d)) { IDirect3DDevice9_DrawIndexedPrimitiveUP(D9, t, mi, nv, pc, ix, f, v, st); d9light_end(d->r); }
-    restore_streams(d);
+    restore_streams(d, &k);
     return hr0;
 }
 static HRESULT WINAPI d_ProcessVertices(dev8 *d, UINT s, UINT di, UINT n, void *b, DWORD f) { return IDirect3DDevice9_ProcessVertices(D9, s, di, n, unwrap(b), NULL, f); }
