@@ -16,7 +16,7 @@ void coop_drive(uint8_t *g, const float m[16], const float vel[3]);
 void coop_remove_glider(uint8_t *g);
 int coop_in_flight(void);
 extern int g_base_world;             // the host's world is running a tick while the host is in a base (#37)
-int coop_base_world_running(void);   // the host is in a base and its world keeps running there
+int coop_base_world_running(void);   // the host is in a base (or a panel) and its world keeps running there
 void aim1_coop_install(void);
 
 // mirror.c: host-authoritative NPCs, shots, deaths, world time

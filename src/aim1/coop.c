@@ -327,21 +327,28 @@ typedef int (THISCALL *runmenu_fn)(void *, void *, int);
 // a joining player's profile is saved as a panel opens: the ESC menu is the way out of the game (#42)
 static void save_before_panel(void) { if (net_mode() == NET_CLIENT) coop_profile_save(); }
 
+static void panel_opened(void);
+static void panel_closed(void);
+
 static int THISCALL panel_modal(void *menu, int a)
 {
     save_before_panel();
+    panel_opened();
     g_flight_panel++;
     int r = CALL(0x0042d5e0, domodal_fn)(menu, a);
     g_flight_panel--;
+    panel_closed();
     return r;
 }
 
 static int THISCALL esc_menu(void *app, void *menu, int a)
 {
     save_before_panel();
+    panel_opened();
     g_flight_panel++;
     int r = CALL(A_RUN_MENU, runmenu_fn)(app, menu, a);
     g_flight_panel--;
+    panel_closed();
     return r;
 }
 
@@ -391,14 +398,43 @@ static int guests_here(void)
     return 0;
 }
 
+// A panel opened in flight (hold / journal / map, the ESC menu) stops the flight loop as well: the
+// guests' NPCs stood still while the host read the map. The world runs from the panel's menu loop as
+// from the base screen's; the host's glider waits where it is, out of the fight (no damage, NPCs go
+// for the others first). Only the world the panel was opened in, with our glider still the same.
+static int g_panel_gen;
+static uint8_t *g_panel_glider;
+
+static void panel_opened(void)
+{
+    if (g_flight_panel) return;      // (the outermost one)
+    g_panel_gen = coop_world_gen();
+    g_panel_glider = G_PLAYER_GLIDER;
+    g_world_ran = 0;
+}
+
+static void panel_closed(void)
+{
+    if (g_flight_panel || !g_world_ran || g_in_base) return;
+    static int nlog;
+    if (nlog++ < 5) mlog("coop: the world ran while the panel was open");
+    g_world_ran = 0;
+}
+
+static int world_runs_here(void)
+{
+    if (g_in_base) return coop_world_gen() == g_base_gen;
+    return g_flight_panel && coop_world_gen() == g_panel_gen && G_PLAYER_GLIDER == g_panel_glider;
+}
+
 static void base_world_tick(void)
 {
     static DWORD last;
     DWORD now = GetTickCount();
     uint8_t *app = G_APP, *pg = G_PLAYER_GLIDER;
-    if (!g_world_in_base || !g_in_base || !g_modal_pump || net_mode() != NET_HOST || !guests_here() ||
-        coop_world_gen() != g_base_gen || !app || *(int *)(app + APP_MODE) == 0 || *(int *)(app + 0x44) ||
-        !pg || !pg[OBJ_ALIVE]) {
+    if (!g_world_in_base || !g_modal_pump || net_mode() != NET_HOST || !guests_here() || !world_runs_here() ||
+        !app || *(int *)(app + APP_MODE) == 0 || *(int *)(app + 0x44) || !pg || !pg[OBJ_ALIVE] ||
+        (!g_in_base && respawn_spectating())) {
         last = now;
         return;
     }
@@ -424,13 +460,13 @@ static void base_world_tick(void)
     loot_base_frame();               // what was dropped meanwhile
     respawn_base_frame();            // a teammate's mechmind among it
     g_base_world = 0;
-    if (!g_world_ran) mlog("coop: in a base with guests here - the world keeps running");
+    if (!g_world_ran) mlog("coop: %s with guests here - the world keeps running", g_in_base ? "in a base" : "in a panel");
     g_world_ran = 1;
 }
 
 int coop_base_world_running(void)
 {
-    return g_in_base && g_world_ran && net_mode() == NET_HOST && coop_world_gen() == g_base_gen;
+    return (g_in_base || g_flight_panel) && g_world_ran && net_mode() == NET_HOST && world_runs_here();
 }
 
 // the fly-out catch-up (see above)
@@ -520,6 +556,9 @@ int cg_command(const char *cmd, const char *arg, const char *line)
         if (!strcmp(cmd, "killnpc")) lstrcpynA(g_test_pilot, arg, 32);
         else sscanf(line, "%*s %*s %31s", g_test_pilot);       // "tonpc <dist> [pilot]"
         mirror_test_tonpc(!strcmp(cmd, "killnpc") ? -1.0f : !strcmp(cmd, "npchit") ? -0.6f : (float)atof(arg));
+    } else if (!strcmp(cmd, "echofire")) {
+        void mirror_test_echofire(int);
+        mirror_test_echofire(atoi(arg) > 0 ? atoi(arg) : 1);
     } else if (!strcmp(cmd, "mirrorstat") && in_flight()) {
         void mirror_test_stat(void);
         mirror_test_stat();
