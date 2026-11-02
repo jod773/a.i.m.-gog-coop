@@ -36,6 +36,7 @@
 #define A_ENTER_NAME      0x00677128                 // name32: the building being entered
 #define TYPE_THING        0x15                       // CTheThing: things lying around to pick up
 #define THING_KIND        0x278
+#define THING_ACTIVE      0x268                      // byte: can be picked up (cleared: taken, rising, soon freed)
 #define KIND_MECHMIND     0x101
 // byte: only the player picks it up (else every glider nearby does, NPCs too) and it never expires
 // (CTheThing::Run deletes other things 1200 s old and over 1000 away from the camera)
@@ -486,7 +487,9 @@ static void spectator_camera(void)
 }
 
 // our own mechmind here - named after us (respawn_new_thing; a guest sees the host's copy of it, named
-// after the guest's puppet) or after our pilot - else our wreck: what the death camera follows
+// after the guest's puppet) or after our pilot - else our wreck: what the death camera follows. Not one a
+// teammate has just taken (+0x268 cleared): it rises and is freed, and the camera on it ended the
+// sequence at once.
 static uint8_t *own_remains(void)
 {
     uint8_t *best = G_PLAYER_GLIDER, *mo = our_mechanoid();
@@ -494,7 +497,7 @@ static uint8_t *own_remains(void)
     for (void **nd = *(void ***)(A_OBJECT_LIST + OBJLIST_HEAD); nd; nd = (void **)nd[1]) {
         uint8_t *o = (uint8_t *)nd[0];
         if (!o || !o[OBJ_ALIVE] || *(int *)(o + OBJ_TYPE) != TYPE_THING || *(int *)(o + THING_KIND) != KIND_MECHMIND ||
-            *(int *)(o + 0x40c) < 1)
+            *(int *)(o + 0x40c) < 1 || !o[THING_ACTIVE])
             continue;
         const char *nm = (const char *)o + 0x27c + 4;
         if (lstrcmpiA(nm, coop_my_name()) && (!mo || lstrcmpiA(nm, (const char *)mo))) continue;
