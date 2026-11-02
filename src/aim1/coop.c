@@ -31,6 +31,12 @@ void coop_notify(const char *text)
 
 static void flush_notices(void)
 {
+    if (respawn_spectating()) {            // a dead player's game draws no HUD: the mod's own overlay
+        void overlay_notice(const char *text);
+        for (int i = 0; i < g_nnotes; i++) overlay_notice(g_notes[i]);
+        g_nnotes = 0;
+        return;
+    }
     uint8_t *msgr = *(uint8_t **)A_MESSAGER_PTR;
     if (!msgr) return;
     typedef void (THISCALL *add_fn)(void *, gstr *, int, int);
