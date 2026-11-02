@@ -11,13 +11,31 @@ static const char UDP_MAGIC[4] = {'R', 'R', 'C', '1'};
 static const char PROBE[4] = {'R', 'R', 'Q', '?'};
 static const char ANSWER[4] = {'R', 'R', 'A', '!'};
 
+// TCP sends never wait (the sockets are non-blocking): what the connection doesn't take at once
+// waits in the peer's send queue, which the network thread empties. A blocking send() ran on the game
+// thread and froze it for as long as a slow link needed (the world at a join: 10-14 s at ~37 KB/s),
+// or for good on a connection that died without closing. Such a connection is found by the pings the
+// network threads exchange (NM_PING every PING_MS): nothing at all from a peer for SILENT_MS, or a send
+// queue that doesn't move for STUCK_MS, drops it.
+#define PING_MS    2000
+#define SILENT_MS  30000
+#define STUCK_MS   60000
+#define SQ_MAX     (64 * 1024 * 1024)
+
 typedef struct {
     SOCKET tcp;
     struct sockaddr_in udp;
+    struct sockaddr_in addr;      // where its TCP connection comes from
     int have_udp;
     uint8_t *rbuf;
     int rlen;
-    CRITICAL_SECTION wcs;
+    CRITICAL_SECTION wcs;         // the socket's sends and the send queue
+    uint8_t *sq;                  // send queue: sq[sq_off .. sq_off + sq_len)
+    int sq_off, sq_len, sq_cap;
+    DWORD sq_moved;               // last time the queue got smaller (or was started)
+    volatile LONG dead;           // a send failed / kicked: the network thread drops it
+    volatile DWORD last_rx;       // last time anything came from it
+    DWORD last_ping;
 } peer;
 
 typedef struct qmsg { struct qmsg *next; netmsg m; } qmsg;
@@ -70,6 +88,17 @@ int net_peer_connected(int id)
     return g_mode == NET_CLIENT && (id == 0 || g_peers[id].have_udp);   // clients only know ids
 }
 
+void net_kick(int id)
+{
+    if (g_mode == NET_HOST && id > 0 && id < NET_MAX_PEERS && g_peers[id].tcp != INVALID_SOCKET) g_peers[id].dead = 1;
+}
+
+int net_same_address(int a, int b)
+{
+    return a > 0 && b > 0 && a < NET_MAX_PEERS && b < NET_MAX_PEERS &&
+           g_peers[a].addr.sin_addr.s_addr == g_peers[b].addr.sin_addr.s_addr;
+}
+
 void net_set_session_name(const char *name, int players)
 {
     lstrcpynA(g_session, name, sizeof g_session);
@@ -117,17 +146,79 @@ static void build(uint8_t *buf, uint8_t type, uint8_t from, uint8_t to, const vo
     if (len) memcpy(buf + HDR, data, len);
 }
 
+// send as much as the socket takes now: bytes sent, or -1 if the connection failed
+static int send_now(SOCKET s, const uint8_t *buf, int n)
+{
+    int done = 0;
+    while (done < n) {
+        int r = send(s, (const char *)buf + done, n - done, 0);
+        if (r > 0) { done += r; continue; }
+        if (r == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) break;
+        return -1;
+    }
+    return done;
+}
+
 static void tcp_send_raw(int pi, const uint8_t *buf, int n)
 {
     peer *p = &g_peers[pi];
     EnterCriticalSection(&p->wcs);
-    while (n > 0 && p->tcp != INVALID_SOCKET) {
-        int r = send(p->tcp, (const char *)buf, n, 0);
-        if (r <= 0) break;
+    if (p->tcp == INVALID_SOCKET || p->dead) goto out;
+    if (!p->sq_len) {                                 // nothing waiting: straight out, in order
+        int r = send_now(p->tcp, buf, n);
+        if (r < 0) { p->dead = 1; goto out; }
         buf += r;
         n -= r;
+        if (!n) goto out;
+        p->sq_moved = GetTickCount();
+    }
+    if (p->sq_len + n > SQ_MAX) { p->dead = 1; goto out; }
+    if (p->sq_off + p->sq_len + n > p->sq_cap) {
+        if (p->sq_off) { memmove(p->sq, p->sq + p->sq_off, p->sq_len); p->sq_off = 0; }
+        if (p->sq_len + n > p->sq_cap) {
+            int cap = p->sq_cap ? p->sq_cap : 65536;
+            while (cap < p->sq_len + n) cap *= 2;
+            uint8_t *q = realloc(p->sq, cap);
+            if (!q) { p->dead = 1; goto out; }
+            p->sq = q;
+            p->sq_cap = cap;
+        }
+    }
+    memcpy(p->sq + p->sq_off + p->sq_len, buf, n);
+    p->sq_len += n;
+out:
+    LeaveCriticalSection(&p->wcs);
+}
+
+// network thread: send what waits in the queue
+static void flush_peer(int pi)
+{
+    peer *p = &g_peers[pi];
+    EnterCriticalSection(&p->wcs);
+    if (p->tcp != INVALID_SOCKET && p->sq_len && !p->dead) {
+        int r = send_now(p->tcp, p->sq + p->sq_off, p->sq_len);
+        if (r < 0) p->dead = 1;
+        else if (r > 0) {
+            p->sq_off += r;
+            p->sq_len -= r;
+            if (!p->sq_len) p->sq_off = 0;
+            p->sq_moved = GetTickCount();
+        }
     }
     LeaveCriticalSection(&p->wcs);
+}
+
+static void free_queue(peer *p)
+{
+    free(p->sq);
+    p->sq = NULL;
+    p->sq_off = p->sq_len = p->sq_cap = 0;
+}
+
+static void make_nonblocking(SOCKET s)
+{
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
 }
 
 static void udp_send_raw(const struct sockaddr_in *to, const uint8_t *buf, int n)
@@ -174,6 +265,7 @@ static void on_message(int pi, const uint8_t *buf, int n, int reliable)
     int len = buf[0] | (buf[1] << 8);
     uint8_t type = buf[2], from = buf[3], to = buf[4];
     if (len + HDR != n) return;
+    if (type == NM_PING) return;                  // only keeps the connection known alive
     if (g_mode == NET_HOST) {
         from = (uint8_t)pi;                       // never trust the sender's claim
         uint8_t *fwd = (uint8_t *)buf;
@@ -195,6 +287,8 @@ static void drop_peer(int pi)
     EnterCriticalSection(&p->wcs);
     if (p->tcp != INVALID_SOCKET) closesocket(p->tcp);
     p->tcp = INVALID_SOCKET;
+    free_queue(p);
+    p->dead = 0;
     LeaveCriticalSection(&p->wcs);
     p->have_udp = 0;
     free(p->rbuf);
@@ -219,6 +313,7 @@ static void read_tcp(int pi)
     int r = recv(p->tcp, (char *)p->rbuf + p->rlen, HDR + NET_MAXMSG - p->rlen, 0);
     if (r < 0 && WSAGetLastError() == WSAEWOULDBLOCK) return;    // nothing yet (a freshly accepted socket)
     if (r <= 0) { drop_peer(pi); return; }
+    p->last_rx = GetTickCount();
     p->rlen += r;
     for (;;) {
         if (p->rlen < HDR) break;
@@ -254,8 +349,10 @@ static void read_udp(void)
         // learn / refresh the peer's UDP address (same host as its TCP connection)
         g_peers[pi].udp = from;
         g_peers[pi].have_udp = 1;
+        g_peers[pi].last_rx = GetTickCount();
         on_message(pi, buf, n, 0);
     } else {
+        g_peers[0].last_rx = GetTickCount();
         on_message(0, buf, n, 0);
     }
 }
@@ -272,9 +369,16 @@ static void accept_peer(void)
     if (id < 0) { closesocket(s); return; }
     BOOL nd = TRUE;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nd, sizeof nd);
+    make_nonblocking(s);
+    EnterCriticalSection(&g_peers[id].wcs);
+    free_queue(&g_peers[id]);
+    g_peers[id].dead = 0;
     g_peers[id].tcp = s;
+    LeaveCriticalSection(&g_peers[id].wcs);
+    g_peers[id].addr = a;
     g_peers[id].rlen = 0;
     g_peers[id].have_udp = 0;
+    g_peers[id].last_rx = g_peers[id].last_ping = GetTickCount();
     mlog("net: peer %d connected from %s", id, inet_ntoa(a.sin_addr));
     uint8_t b = (uint8_t)id;
     uint8_t buf[HDR + 1];
@@ -294,23 +398,55 @@ static void accept_peer(void)
     enqueue(NM_PEER_JOIN, 0, &b, 1);
 }
 
+// network thread, between selects: pings, and the connections that are gone
+static void housekeeping(void)
+{
+    DWORD now = GetTickCount();
+    for (int i = 0; i < NET_MAX_PEERS; i++) {
+        peer *p = &g_peers[i];
+        if (p->tcp == INVALID_SOCKET) continue;
+        const char *why = NULL;
+        if (p->dead) why = "connection failed";
+        else if (now - p->last_rx > SILENT_MS) why = "nothing from it for 30 s";
+        else if (p->sq_len && now - p->sq_moved > STUCK_MS) why = "its data doesn't go out";
+        if (why) {
+            mlog("net: %s %d dropped - %s", g_mode == NET_HOST ? "peer" : "host", i, why);
+            drop_peer(i);
+            continue;
+        }
+        if (now - p->last_ping >= PING_MS) {
+            p->last_ping = now;
+            uint8_t b[HDR];
+            build(b, NM_PING, (uint8_t)g_my_id, (uint8_t)i, NULL, 0);
+            tcp_send_raw(i, b, HDR);
+        }
+    }
+}
+
 static DWORD WINAPI net_thread(void *arg)
 {
     (void)arg;
     while (!g_quit) {
-        fd_set rs;
+        housekeeping();
+        fd_set rs, ws;
         FD_ZERO(&rs);
+        FD_ZERO(&ws);
         if (g_udp != INVALID_SOCKET) FD_SET(g_udp, &rs);
         if (g_listen != INVALID_SOCKET) FD_SET(g_listen, &rs);
-        for (int i = 0; i < NET_MAX_PEERS; i++)
-            if (g_peers[i].tcp != INVALID_SOCKET) FD_SET(g_peers[i].tcp, &rs);
+        for (int i = 0; i < NET_MAX_PEERS; i++) {
+            if (g_peers[i].tcp == INVALID_SOCKET) continue;
+            FD_SET(g_peers[i].tcp, &rs);
+            if (g_peers[i].sq_len) FD_SET(g_peers[i].tcp, &ws);
+        }
         struct timeval tv = {0, 20000};
         if (rs.fd_count == 0) { Sleep(20); continue; }
-        if (select(0, &rs, NULL, NULL, &tv) <= 0) continue;
+        if (select(0, &rs, ws.fd_count ? &ws : NULL, NULL, &tv) <= 0) continue;
         if (g_udp != INVALID_SOCKET && FD_ISSET(g_udp, &rs)) read_udp();
         if (g_listen != INVALID_SOCKET && FD_ISSET(g_listen, &rs)) accept_peer();
-        for (int i = 0; i < NET_MAX_PEERS; i++)
+        for (int i = 0; i < NET_MAX_PEERS; i++) {
+            if (g_peers[i].tcp != INVALID_SOCKET && FD_ISSET(g_peers[i].tcp, &ws)) flush_peer(i);
             if (g_peers[i].tcp != INVALID_SOCKET && FD_ISSET(g_peers[i].tcp, &rs)) read_tcp(i);
+        }
     }
     return 0;
 }
@@ -405,6 +541,9 @@ int net_join(const char *host, int port)
         return 0;
     }
     g_my_id = hdr[HDR];
+    make_nonblocking(s);
+    g_peers[0].addr = g_host_udp;
+    g_peers[0].last_rx = g_peers[0].last_ping = GetTickCount();
     g_mode = NET_CLIENT;
     start_thread();
     net_send(0, NM_YOUR_ID, NULL, 0, 0);     // registers our UDP address with the host
@@ -417,9 +556,25 @@ void net_stop(void)
     if (!g_inited) return;
     g_quit = 1;
     if (g_thread) { WaitForSingleObject(g_thread, 2000); CloseHandle(g_thread); g_thread = NULL; }
+    // what is still queued (a leaving guest's last profile) gets a moment to go out
+    for (DWORD t0 = GetTickCount(); GetTickCount() - t0 < 1500;) {
+        fd_set ws;
+        FD_ZERO(&ws);
+        for (int i = 0; i < NET_MAX_PEERS; i++)
+            if (g_peers[i].tcp != INVALID_SOCKET && g_peers[i].sq_len && !g_peers[i].dead) FD_SET(g_peers[i].tcp, &ws);
+        if (!ws.fd_count) break;
+        struct timeval tv = {0, 50000};
+        if (select(0, NULL, &ws, NULL, &tv) <= 0) continue;
+        for (int i = 0; i < NET_MAX_PEERS; i++)
+            if (g_peers[i].tcp != INVALID_SOCKET && FD_ISSET(g_peers[i].tcp, &ws)) flush_peer(i);
+    }
     for (int i = 0; i < NET_MAX_PEERS; i++) {
+        EnterCriticalSection(&g_peers[i].wcs);
         if (g_peers[i].tcp != INVALID_SOCKET) closesocket(g_peers[i].tcp);
         g_peers[i].tcp = INVALID_SOCKET;
+        free_queue(&g_peers[i]);
+        g_peers[i].dead = 0;
+        LeaveCriticalSection(&g_peers[i].wcs);
         g_peers[i].have_udp = 0;
         free(g_peers[i].rbuf);
         g_peers[i].rbuf = NULL;
