@@ -351,6 +351,13 @@ void loot_frame(void)
     else if (net_mode() == NET_CLIENT) guest_frame();
 }
 
+// the host's world ticked in a base (coop.c, #37): what it dropped meanwhile (an NPC's loot, a dead
+// teammate's mechmind) goes out to the guests flying in it, and their pickups take it away
+void loot_base_frame(void)
+{
+    if (net_mode() == NET_HOST) host_scan();
+}
+
 void loot_reset(void)
 {
     memset(g_t, 0, sizeof g_t);       // (the objects belong to the world: it frees them)

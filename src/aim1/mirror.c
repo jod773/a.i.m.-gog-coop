@@ -960,7 +960,10 @@ static void player_down(const char *name)
     int peer = g ? coop_remote_peer(g) : -1;
     if (peer < 0) { mlog("mirror: %s destroyed (no puppet here)", name); return; }
     uint8_t *mo = glider_mechanoid(g);
-    int boom = coop_in_flight() && !g_coop_menu && mo && g[OBJ_ALIVE] && !g[GLIDER_DYING] && alive_object(g);
+    // In a base the host's world keeps running (#37): the puppet explodes there too and drops their
+    // mechmind. Removed instead, it dropped none, and nobody could bring the player back.
+    int world = (coop_in_flight() && !g_coop_menu) || coop_base_world_running();
+    int boom = world && mo && g[OBJ_ALIVE] && !g[GLIDER_DYING] && alive_object(g);
     if (boom) {
         no_local_loot(g);              // a guest gets the host's drop (their mechmind) through loot.c
         mo[0x74] = 1;

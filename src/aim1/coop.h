@@ -16,6 +16,7 @@ void coop_drive(uint8_t *g, const float m[16], const float vel[3]);
 void coop_remove_glider(uint8_t *g);
 int coop_in_flight(void);
 extern int g_base_world;             // the host's world is running a tick while the host is in a base (#37)
+int coop_base_world_running(void);   // the host is in a base and its world keeps running there
 void aim1_coop_install(void);
 
 // mirror.c: host-authoritative NPCs, shots, deaths, world time
@@ -41,6 +42,7 @@ void respawn_player_down(int peer, const char *name, const uint8_t *puppet);
 int respawn_handle(int type, int from, const uint8_t *data, int len);
 void respawn_frame(void);
 void respawn_base_entered(void);
+void respawn_base_frame(void);
 void respawn_reset(void);
 void respawn_test(const char *cmd);
 
@@ -57,6 +59,7 @@ void mapmark_test(void);
 // loot.c: the host's things lying around (dropped loot), shown on the guests (#27)
 void loot_install(void);
 void loot_frame(void);
+void loot_base_frame(void);
 void loot_reset(void);
 void loot_peer_joined(int peer);
 int loot_handle(int type, int from, const uint8_t *data, int len);
