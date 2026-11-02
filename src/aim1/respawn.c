@@ -214,6 +214,7 @@ static void track_mechminds(void)
 // we are flying into a building: the mechminds we carry are delivered
 static void deliver(void)
 {
+    if (net_mode() == NET_OFF || !G_PLAYER_GLIDER || player_dead()) return;
     char where[32];
     lstrcpynA(where, (const char *)A_ENTER_NAME, sizeof where);
     for (int i = 0; i < NET_MAX_PEERS; i++) {
@@ -230,6 +231,15 @@ static void deliver(void)
         coop_notify(msg);
         memset(f, 0, sizeof *f);
     }
+}
+
+// The base screen opens (coop.c base_modal): a building's Run sets 0x677120 / 0x677124 = 1 inside
+// Render, after ProcessInput, and CycleGame goes into the base as soon as that frame ends - the
+// check in ProcessInput never saw the 1 in real play (only the harness "enter", which set it before
+// the frame). The building's name is still at 0x677128.
+void respawn_base_entered(void)
+{
+    if (*(int *)A_LEAVE_GAME == 1) deliver();
 }
 
 int respawn_handle(int type, int from, const uint8_t *data, int len)
@@ -374,9 +384,6 @@ static void spectator_camera(void)
 
 static void THISCALL h_process_input(uint8_t *app)
 {
-    if (net_mode() != NET_OFF && G_PLAYER_GLIDER && *(int *)(app + APP_MODE) != 0 && !player_dead() &&
-        *(int *)A_LEAVE_GAME == 1)
-        deliver();
     if (net_mode() != NET_OFF && G_PLAYER_GLIDER && *(int *)(app + APP_MODE) != 0 && player_dead()) {
         int tab = KEYS[DIK_TAB] < 0;
         if (tab && !g_tab_was_down) g_watch++;        // next teammate
@@ -413,6 +420,8 @@ static void THISCALL h_process_input(uint8_t *app)
     // (0x677124 = 2, 0x677120 = 1). While spectating, that is undone.
     int leave = *(int *)A_LEAVE_GAME, flag = *(uint8_t *)A_LEAVE_FLAG;
     o_process_input(app);
+    void aim1_debug_after_input(void);
+    aim1_debug_after_input();                     // the harness / debug menu's building entry
     if (g_spectating) spectator_camera();
     if (g_spectating && *(int *)A_LEAVE_GAME == 2 && leave != 2) {
         *(int *)A_LEAVE_GAME = leave;

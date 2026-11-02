@@ -361,6 +361,7 @@ typedef void (THISCALL *catchup_fn)(void *, float);
 
 static int THISCALL base_modal(void *menu, int a)
 {
+    respawn_base_entered();          // mechminds we carry are delivered here
     g_in_base = 1;
     g_base_gen = coop_world_gen();
     g_world_ran = 0;

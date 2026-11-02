@@ -40,6 +40,7 @@ int respawn_spectating(void);
 void respawn_player_down(int peer, const char *name, const uint8_t *puppet);
 int respawn_handle(int type, int from, const uint8_t *data, int len);
 void respawn_frame(void);
+void respawn_base_entered(void);
 void respawn_reset(void);
 void respawn_test(const char *cmd);
 
