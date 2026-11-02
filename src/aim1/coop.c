@@ -150,6 +150,13 @@ void coop_remove_glider(uint8_t *g)
             CALL(0x004dfde0, forget_fn)(o, g);
             if (*(uint8_t **)(o + 0xb98) == g) *(uint8_t **)(o + 0xb98) = NULL;
         }
+        // turrets (CTowerObject, type 0x16) aiming at it: CTowerObject::Run (0x4f7f30) reads the target's
+        // +0x10d0 every frame - a guest crashed there when it flew past a base after losing the host
+        if (type == 0x16 && *(uint8_t **)(o + 0x23c) == g) {
+            *(uint8_t **)(o + 0x23c) = NULL;
+            static int nlog;
+            if (nlog++ < 10) mlog("coop: turret %p no longer aims at the removed glider", o);
+        }
     }
     // a dead player's camera watching it (respawn.c): the camera's "look at" object (+0x2cc, read every
     // frame in modes 1 / 3 / 4) and the death camera's (0x677e00) - our own glider instead
