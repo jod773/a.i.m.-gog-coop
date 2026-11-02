@@ -42,12 +42,22 @@ def send(game, lines, timeout=30):
         time.sleep(0.05)
 
 
+def game_path(game, p):
+    """p as the game writes it: relative to the game folder (its working directory), so a space higher up
+    in the project's path never reaches the harness line (DLLs before this fix cut it there)"""
+    try:
+        r = os.path.relpath(p, game)
+    except ValueError:                  # another drive
+        return p
+    return r if ' ' not in r else p
+
+
 def shot(game, name, scale=0.6):
     from PIL import Image
     bmp = os.path.join(SCRATCH, name + '.bmp')
     if os.path.exists(bmp):
         os.remove(bmp)
-    send(game, ['shot ' + bmp])
+    send(game, ['shot ' + game_path(game, bmp)])
     t = time.time()
     while not os.path.exists(bmp) and time.time() - t < 15:
         time.sleep(0.1)
@@ -72,7 +82,7 @@ def burst(game, name, n=8, gap=0.15, scale=0.3):
         bmp = os.path.join(SCRATCH, '%s_%d.bmp' % (name, i))
         if os.path.exists(bmp):
             os.remove(bmp)
-        send(game, ['shot ' + bmp])
+        send(game, ['shot ' + game_path(game, bmp)])
         t = time.time()
         while not os.path.exists(bmp) and time.time() - t < 5:
             time.sleep(0.02)

@@ -632,7 +632,10 @@ static void run_cmd(char *line)
     if (sscanf(line, "%31s", cmd) != 1) return;
     mlog("harness: %s", line);
     if (!strcmp(cmd, "shot") && sscanf(line, "%*s %259s", a) == 1) {
-        lstrcpynA(g_shot_path, a, MAX_PATH);
+        const char *p = strstr(line, cmd) + strlen(cmd);    // the rest of the line: a path may have spaces
+        while (*p == ' ' || *p == '\t') p++;
+        lstrcpynA(g_shot_path, p, MAX_PATH);
+        for (int n = lstrlenA(g_shot_path); n > 0 && (unsigned char)g_shot_path[n - 1] <= ' '; ) g_shot_path[--n] = 0;
         g_shot_req = 1;
     } else if (!strcmp(cmd, "virtual") && sscanf(line, "%*s %31s", a) == 1) {
         g_virtual = !strcmp(a, "on");
