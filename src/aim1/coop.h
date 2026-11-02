@@ -39,6 +39,7 @@ void questlog_test(const char *cmd, const char *arg);
 void respawn_install(void);
 int respawn_spectating(void);
 void respawn_player_down(int peer, const char *name, const uint8_t *puppet);
+void respawn_new_thing(uint8_t *t);
 int respawn_handle(int type, int from, const uint8_t *data, int len);
 void respawn_frame(void);
 void respawn_base_entered(void);
