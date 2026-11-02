@@ -23,6 +23,7 @@ enum {                              // transport-level message types (game types
     NM_PEER_LEAVE = 2,             // host -> all: [u8 id]
     NM_YOUR_ID = 3,                // host -> new client: [u8 id]
     NM_DISCONNECTED = 4,           // local only: lost the host
+    NM_PING = 5,                   // network threads, every 2 s: the connection is alive (not delivered)
 };
 
 void net_preload(void);                         // call at startup (loads the Winsock providers)
@@ -32,6 +33,8 @@ void net_stop(void);
 int net_mode(void);
 int net_my_id(void);                            // host = 0
 int net_peer_connected(int id);
+void net_kick(int id);                          // host: drop that player's connection
+int net_same_address(int a, int b);             // host: two players' connections come from one IP address
 // Send to one peer (or NET_ALL). Clients send everything to the host, which
 // forwards messages for others. reliable=0 uses UDP.
 void net_send(int to, uint8_t type, const void *data, int len, int reliable);

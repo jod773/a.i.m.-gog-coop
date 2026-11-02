@@ -518,6 +518,14 @@ static void handle(const netmsg *m)
         r->name[31] = 0;
         r->clan = m->len >= 33 ? m->data[32] : 0;
         mlog("coop: player %d is '%s'", id, r->name);
+        // the same player back on a new connection: the old one is dead, only nobody noticed yet
+        // (a guest's game restarted, a VPN dropped) - it would stay in the game as a ghost
+        if (first && net_mode() == NET_HOST && id > 0)
+            for (int j = 1; j < NET_MAX_PEERS; j++)
+                if (j != id && g_rem[j].name[0] && !lstrcmpiA(g_rem[j].name, r->name) && net_same_address(j, id)) {
+                    mlog("coop: %s is back as player %d - player %d's old connection dropped", r->name, id, j);
+                    net_kick(j);
+                }
         if (first && GetTickCount() - g_session_t0 > 3000) {
             snprintf(nb, sizeof nb, cg_text("joined"), r->name);
             coop_notify(nb);
