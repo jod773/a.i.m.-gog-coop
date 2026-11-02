@@ -33,8 +33,8 @@ typedef void (THISCALL *str_fn)(void *, const char *);
 static str_fn o_set_flag;
 static int g_from_host;              // log_merge is applying the host's log
 
-static uint8_t *g_pending;
-static int g_pending_len, g_pending_from;
+static uint8_t *g_pending[NET_MAX_PEERS];          // the last log of each player, until we merge it
+static int g_pending_len[NET_MAX_PEERS], g_pending_from;
 static uint32_t g_known;
 static DWORD g_last_tick;
 
@@ -456,11 +456,12 @@ static void announce(const uint8_t *b, int len)
     net_send(NET_ALL, MSG_SAY_, msg, (int)strlen(msg) + 1, 1);
 }
 
-// our changes go out at once, in flight, in bases and in dialogues
-static void send_changes(void)
+// our changes go out at once in flight (menu loops can't read the quest data: they also run while a
+// save loads), so what changed in a base or a dialogue goes out when we fly again
+static void send_changes(int force)
 {
     DWORD now = GetTickCount();
-    if (now - g_last_tick < 500) return;
+    if (!force && now - g_last_tick < 500) return;
     g_last_tick = now;
     int len;
     uint8_t *b = log_save(&len);
@@ -481,11 +482,16 @@ static void send_changes(void)
 void questlog_frame(void)
 {
     if (net_mode() == NET_OFF || !coop_in_flight()) return;
-    if (g_pending) {                                  // others' progress: merged in flight only
-        int n = log_merge(g_pending, g_pending_len, net_mode() == NET_HOST);
-        if (n) mlog("questlog: %d entries from player %d", n, g_pending_from);
-        free(g_pending);
-        g_pending = NULL;
+    for (int p = 0; p < NET_MAX_PEERS; p++) {         // others' progress: merged in flight only
+        if (!g_pending[p]) continue;
+        // A guest's own changes first: after the merge the whole log counts as the host's (g_known),
+        // and what we did in a base (visits, briefings, removed flags) never went up.
+        if (net_mode() == NET_CLIENT) send_changes(1);
+        g_pending_from = p;
+        int n = log_merge(g_pending[p], g_pending_len[p], net_mode() == NET_HOST);
+        if (n) mlog("questlog: %d entries from player %d", n, p);
+        free(g_pending[p]);
+        g_pending[p] = NULL;
         if (n) {
             int len;
             uint8_t *b = log_save(&len);
@@ -495,14 +501,7 @@ void questlog_frame(void)
             }
         }
     }
-    send_changes();
-}
-
-// in bases and dialogues (the menu loops): send our changes
-void questlog_menu_tick(void)
-{
-    if (net_mode() == NET_OFF || !G_SCRIPTS || !G_APP || *(int *)(G_APP + APP_MODE) == 0) return;
-    send_changes();
+    send_changes(0);
 }
 
 void questlog_peer_joined(int peer)
@@ -516,18 +515,22 @@ int questlog_handle(int type, int from, const uint8_t *data, int len)
 {
     if (type != MSG_LOG && type != MSG_LOG_UP) return 0;
     if ((type == MSG_LOG && net_mode() != NET_CLIENT) || (type == MSG_LOG_UP && net_mode() != NET_HOST)) return 1;
-    free(g_pending);
-    g_pending = malloc(len);
-    memcpy(g_pending, data, len);
-    g_pending_len = len;
-    g_pending_from = from;
+    if (from < 0 || from >= NET_MAX_PEERS) return 1;
+    // a player's newer log has all of its older one; another player's must not replace it while we
+    // aren't flying (the host in a base gets every guest's)
+    free(g_pending[from]);
+    g_pending[from] = malloc(len);
+    memcpy(g_pending[from], data, len);
+    g_pending_len[from] = len;
     return 1;
 }
 
 void questlog_reset(void)
 {
-    free(g_pending);
-    g_pending = NULL;
+    for (int p = 0; p < NET_MAX_PEERS; p++) {
+        free(g_pending[p]);
+        g_pending[p] = NULL;
+    }
     g_known = 0;
     set_prev(NULL, 0);
     removed_reset();
