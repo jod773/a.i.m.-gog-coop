@@ -340,7 +340,9 @@ int loot_handle(int type, int from, const uint8_t *data, int len)
         if (net_mode() == NET_CLIENT) { g_end = 1; mlog("loot: the host's things received"); }
         return 1;
     case MSG_THING_TAKEN:
-        if (net_mode() == NET_HOST && len >= 2 && coop_in_flight() && !g_coop_menu) host_taken(*(const uint16_t *)data, from);
+        // (also while our world runs in a base: the guest has the goods, the thing must go here too)
+        if (net_mode() == NET_HOST && len >= 2 && ((coop_in_flight() && !g_coop_menu) || coop_base_world_running()))
+            host_taken(*(const uint16_t *)data, from);
         return 1;
     }
     return 0;

@@ -562,11 +562,13 @@ typedef struct { uint8_t *g; int slot; double last_call, last_sent; } fire_src;
 typedef struct { fire_msg f; double until; } fire_hold;
 static fire_src g_fsrc[MAXFSRC];
 static fire_hold g_fhold[MAXHOLD];
+static int g_nqfire;                  // shots queued while the host's world runs in a base (below)
 
 static void fire_reset(void)
 {
     memset(g_fsrc, 0, sizeof g_fsrc);
     memset(g_fhold, 0, sizeof g_fhold);
+    g_nqfire = 0;
 }
 
 static double now_ms(void)
@@ -675,6 +677,29 @@ static void fire_received(const fire_msg *f)
     h->until = now_ms() + HOLD_KEEP_MS;
     static int nlog;
     if (nlog++ < 5) mlog("mirror: %s keeps firing (slot %d)", f->shooter, f->slot & 3);
+}
+
+// The host in a base (or a panel) with its world running (coop.c): the guests' shots arrive in the menu
+// loop, outside the world's tick - they were dropped, and the guests' fights did no damage. Kept here
+// and fired in the next tick.
+#define MAXQFIRE 64
+static fire_msg g_qfire[MAXQFIRE];
+static fire_msg g_last_fire;          // test "echofire": the last shot a guest got (the host's NPCs')
+static int g_have_last_fire;
+
+// test: "echofire [n]" - a guest sends the last NPC shot it got back to the host, n times: a shot that
+// arrives on the host like a guest's (in flight: replayed at once; in a base: queued for the world tick)
+void mirror_test_echofire(int n)
+{
+    if (net_mode() != NET_CLIENT || !g_have_last_fire) { mlog("echofire: no shot seen yet"); return; }
+    for (int i = 0; i < n; i++) net_send(0, MSG_FIRE, &g_last_fire, sizeof g_last_fire, 1);
+    mlog("echofire: %d of %s's shots sent to the host", n, g_last_fire.shooter);
+}
+
+static void queue_fire(const fire_msg *f)
+{
+    if (g_nqfire == MAXQFIRE) memmove(g_qfire, g_qfire + 1, --g_nqfire * sizeof *g_qfire);   // the oldest goes
+    g_qfire[g_nqfire++] = *f;
 }
 
 // continuous guns of the others fire on each of our frames while their news is fresh
@@ -1053,7 +1078,10 @@ int mirror_handle(int type, int from, const uint8_t *data, int len)
         got_player_health(data, len);
         return 1;
     case MSG_FIRE:
-        if (len == sizeof(fire_msg) && coop_in_flight() && !g_coop_menu) fire_received((const fire_msg *)data);
+        if (len != sizeof(fire_msg)) return 1;
+        if (net_mode() == NET_CLIENT) { g_last_fire = *(const fire_msg *)data; g_have_last_fire = 1; }
+        if (coop_in_flight() && !g_coop_menu) fire_received((const fire_msg *)data);
+        else if (net_mode() == NET_HOST && coop_base_world_running()) queue_fire((const fire_msg *)data);
         return 1;
     case MSG_NPC_BOOM:
         if (len >= 2 && coop_in_flight() && !g_coop_menu) replay_boom(*(const uint16_t *)data);
@@ -1161,6 +1189,11 @@ static void host_frame(void)
 void mirror_base_frame(void)
 {
     if (net_mode() != NET_HOST) return;
+    for (int i = 0; i < g_nqfire; i++) fire_received(&g_qfire[i]);
+    static int nlog;
+    if (g_nqfire && nlog++ < 5) mlog("mirror: %d shots of the guests fired while our world runs in a base / panel", g_nqfire);
+    g_nqfire = 0;
+    hold_frame();
     host_frame();
     apply_player_health();
 }
@@ -1211,12 +1244,47 @@ static unsigned THISCALL h_groups_run(uint8_t *list, float dt, int a, int b)
     return r;
 }
 
+// The world keeps gliders only around the viewer: CMechGroup::Run (0x505a30) drops a group's gliders
+// beyond 1.1x the view range from the camera (0x68f0d4, vf 0x2c) and gives an abstract group its gliders
+// back between 1/4 and 0.95x of it (vf 0x28). The camera is the host's, so a guest flying away from the
+// host left every NPC behind - the groups around the guest dropped their gliders, or never had any - and
+// when the host's camera jumped (out of a base far off, a passage) every NPC near the guests vanished at
+// once. On the host, each group runs with the nearest player - the host's camera or a guest's glider - as
+// its viewer.
+#define CAMERA_POS   ((float *)0x0068f0d4)
+#define GROUP_POS    0x6254
+typedef void (THISCALL *group_run_fn)(uint8_t *, float);
+static group_run_fn o_group_run;
+
+static void THISCALL h_group_run(uint8_t *grp, float dt)
+{
+    const float *best = NULL;
+    if (net_mode() == NET_HOST && grp != G_PLAYER_MECH) {
+        const float *gp = (const float *)(grp + GROUP_POS), *cam = CAMERA_POS;
+        float bd = (gp[0] - cam[0]) * (gp[0] - cam[0]) + (gp[1] - cam[1]) * (gp[1] - cam[1]) + (gp[2] - cam[2]) * (gp[2] - cam[2]);
+        uint8_t *p;
+        for (int i = 0; (p = coop_remote_by_index(i, NULL)) != NULL; i++) {
+            if (!p[OBJ_ALIVE] || p[GLIDER_DYING]) continue;
+            const float *q = (const float *)(p + OBJ_POS);
+            float d = (gp[0] - q[0]) * (gp[0] - q[0]) + (gp[1] - q[1]) * (gp[1] - q[1]) + (gp[2] - q[2]) * (gp[2] - q[2]);
+            if (d < bd) { bd = d; best = q; }
+        }
+    }
+    if (!best) { o_group_run(grp, dt); return; }
+    float keep[3];
+    memcpy(keep, CAMERA_POS, sizeof keep);
+    memcpy(CAMERA_POS, best, sizeof keep);
+    o_group_run(grp, dt);
+    memcpy(CAMERA_POS, keep, sizeof keep);
+}
+
 void mirror_install(void)
 {
     static const uint8_t pro[5] = {0x55, 0x8b, 0xec, 0x6a, 0xff};   // push ebp; mov ebp, esp; push -1
     o_ai_run = (run0_fn)hook_jmp(0x005136a0, pro, 5, h_ai_run);               // CBasicGLAI::Run
     o_org_run = (run1_fn)hook_jmp(0x004de550, pro, 5, h_org_run);             // COrgManager::Run (hourly)
     o_groups_run = (grouplist_run_fn)hook_jmp(0x00500760, pro, 5, h_groups_run);   // CMechGroupList::Run
+    o_group_run = (group_run_fn)hook_jmp(0x00505a30, pro, 5, h_group_run);    // CMechGroup::Run: the nearest player views it
     o_fire = (fire_fn)hook_jmp(0x004daa90, pro, 5, h_fire);                   // CGun::FIRE
     o_damage = (damage_fn)hook_jmp(0x004fb380, pro, 5, h_damage);             // CGliderObject::Damage
     o_glider_run = (glider_run_fn)hook_jmp(0x004f9b80, pro, 5, h_glider_run);   // CGlider::Run

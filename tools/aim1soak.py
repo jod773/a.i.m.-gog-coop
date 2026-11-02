@@ -88,6 +88,25 @@ def find_link(png):
     return (int((min(x for _, x in pick) + 15) * s), int(y * s))
 
 
+def flying(who):
+    """`who` is in flight: the harness `pos` answers only there"""
+    p = os.path.join(G[who], h.log_of(G[who]))
+    n = os.path.getsize(p)
+    h.send(G[who], ['pos', 'sleep 300'])
+    with open(p, 'rb') as f:
+        f.seek(n)
+        return b'debug: position' in f.read()
+
+
+def leave_base(who):
+    """fly out; a link that opened a dialog (the orange "repair" in a greeting) can keep the base screen up"""
+    for _ in range(4):
+        if flying(who):
+            return True
+        h.send(G[who], ['key 0x01', 'sleep 1500', 'click 230 875', 'sleep 6000'])
+    return flying(who)
+
+
 def base_visit(who):
     g = G[who]
     b = random.choice(BUILDINGS)
@@ -98,7 +117,8 @@ def base_visit(who):
     if link:
         acts = ['click %d %d' % link, 'sleep 2500']
     h.send(g, acts + ['click 230 875', 'sleep 9000'])
-    return '%s visited %s%s' % (who, b, ' (accepted a mission)' if link else '')
+    out = '' if leave_base(who) else ' - STILL IN THE BASE'
+    return '%s visited %s%s%s' % (who, b, ' (accepted a mission)' if link else '', out)
 
 
 def fly(who):
