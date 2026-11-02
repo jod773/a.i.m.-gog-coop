@@ -117,12 +117,29 @@ def fly(who):
     return '%s flew' % who
 
 
+def location_buildings(who):
+    """the buildings of the location `who` is in (harness `buildings`), passage tunnels left out: going
+    through one is a trip to another location, not a base visit"""
+    log_new(who)
+    h.send(G[who], ['buildings', 'sleep 300'])
+    names = []
+    for line in log_new(who).splitlines():
+        f = line.split('buildings: ', 1)[-1].split() if 'buildings: ' in line else []
+        if len(f) >= 2 and f[1] != 'BLD_TUNNEL':
+            names.append(f[0])
+    return names
+
+
 def main():
     minutes = float(sys.argv[1])
     if len(sys.argv) > 2:                 # solo <who>: base visits only, one instance, no session
         for k in list(G):
             if k != sys.argv[2]:
                 del G[k]
+    found = location_buildings(list(G)[0])
+    if found:
+        BUILDINGS[:] = found
+    print('buildings:', ' '.join(BUILDINGS), flush=True)
     for who in G:
         log_new(who)
     t0 = time.time()
