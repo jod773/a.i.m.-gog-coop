@@ -66,8 +66,21 @@ static void teleport_to(uint8_t *b)
     coop_notify(buf);
 }
 
+// A building's Run sets these inside Render, after ProcessInput, and CycleGame goes into the base when
+// that frame ends. Entering is done at the same point (aim1_debug_after_input, from the ProcessInput
+// hook): set before the frame, ProcessInput saw a building entry that real flying never shows it.
+static uint8_t *g_enter_pending;
+
 static void enter(uint8_t *b)
 {
+    g_enter_pending = b;
+}
+
+void aim1_debug_after_input(void)
+{
+    uint8_t *b = g_enter_pending;
+    g_enter_pending = NULL;
+    if (!b || !b[OBJ_ALIVE]) return;
     memcpy((void *)A_ENTER_NAME, b + OBJ_NAME, 32);
     memcpy((void *)A_ENTER_NAME2, b + 0x34, 32);
     *(uint8_t **)A_ENTER_OBJ = b;
