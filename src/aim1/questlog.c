@@ -33,8 +33,8 @@ typedef void (THISCALL *str_fn)(void *, const char *);
 static str_fn o_set_flag;
 static int g_from_host;              // log_merge is applying the host's log
 
-static uint8_t *g_pending;
-static int g_pending_len, g_pending_from;
+static uint8_t *g_pending[NET_MAX_PEERS];          // the last log of each player, until we merge it
+static int g_pending_len[NET_MAX_PEERS], g_pending_from;
 static uint32_t g_known;
 static DWORD g_last_tick;
 
@@ -97,13 +97,36 @@ static void host_track_removed(void)
     for (int i = 0; (f = flag_name(i, &n)) != NULL && g_nhad < n; i++) g_had[g_nhad++] = _strdup(f);
 }
 
+// A guest's own scripts remove flags too: joining a clan takes the other clans' ".MEMBER" away, a
+// briefing its ".NC". The host's log still had them and the union put them back - the guest stayed in
+// two clans, the briefing came again. The guest keeps what its scripts removed (REMOVEEVENT hook) and
+// sends it up with its log; the host removes them (and so, through its own removed list, for everyone).
+// Until the host's log no longer has one, the guest doesn't take it back from there.
+static char **g_mine;
+static int g_nmine;
+static int g_merging;                // log_merge runs: its removals and flags aren't this player's own
+
+static void list_add(char ***l, int *n, const char *s)
+{
+    if (strlen(s) > 255 || in_list_of(*l, *n, s) >= 0) return;
+    *l = realloc(*l, (*n + 1) * sizeof **l);
+    (*l)[(*n)++] = _strdup(s);
+}
+
+static void list_drop(char **l, int *n, int i)
+{
+    free(l[i]);
+    l[i] = l[--*n];
+}
+
 static void removed_reset(void)
 {
     for (int i = 0; i < g_nhad; i++) free(g_had[i]);
     for (int i = 0; i < g_nremoved; i++) free(g_removed[i]);
-    free(g_had); free(g_removed);
-    g_had = g_removed = NULL;
-    g_nhad = g_nremoved = 0;
+    for (int i = 0; i < g_nmine; i++) free(g_mine[i]);
+    free(g_had); free(g_removed); free(g_mine);
+    g_had = g_removed = g_mine = NULL;
+    g_nhad = g_nremoved = g_nmine = 0;
 }
 
 // ---- task timers ----------------------------------------------------------------------------
@@ -197,10 +220,15 @@ static uint8_t *log_save(int *len)
     int n, need = 0;
     const char *f;
     for (int i = 0; (f = flag_name(i, &n)) != NULL; i++) need += (int)strlen(f) + 1;
+    // removed flags: the host's (its scripts' and the guests'), a guest's own scripts'
+    char **rl = g_mine;
+    int rn = g_nmine;
     if (net_mode() == NET_HOST) {
         host_track_removed();
-        for (int i = 0; i < g_nremoved; i++) need += (int)strlen(g_removed[i]) + 1;
+        rl = g_removed;
+        rn = g_nremoved;
     }
+    for (int i = 0; i < rn; i++) need += (int)strlen(rl[i]) + 1;
     out = realloc(out, pos + need + 16);
     for (int i = 0; (f = flag_name(i, &n)) != NULL; i++) {
         int l = (int)strlen(f);
@@ -211,17 +239,16 @@ static uint8_t *log_save(int *len)
         if (++nf == 0xffff) break;
     }
     *(uint16_t *)(out + fpos) = (uint16_t)nf;
-    // the host: flags its scripts removed (REMOVEEVENT) - a guest that still has them drops them
+    // flags removed (REMOVEEVENT) - whoever still has them drops them
     int rpos = pos, nr = 0;
     pos += 2;
-    if (net_mode() == NET_HOST)
-        for (int i = 0; i < g_nremoved && nr < 0xffff; i++) {
-            int l = (int)strlen(g_removed[i]);
-            out[pos++] = (uint8_t)l;
-            memcpy(out + pos, g_removed[i], l);
-            pos += l;
-            nr++;
-        }
+    for (int i = 0; i < rn && nr < 0xffff; i++) {
+        int l = (int)strlen(rl[i]);
+        out[pos++] = (uint8_t)l;
+        memcpy(out + pos, rl[i], l);
+        pos += l;
+        nr++;
+    }
     *(uint16_t *)(out + rpos) = (uint16_t)nr;
     // the running task timers
     int nt = 0, tpos;
@@ -238,8 +265,23 @@ static uint8_t *log_save(int *len)
     return out;
 }
 
-// Adds whatever the blob has and we don't. Returns the number of additions.
+static int blob_has(const uint8_t *b, int len, int journal, const char *item);
+static int merge(const uint8_t *b, int len, int from_guest);
+
+// Adds whatever the blob has and we don't, and drops what it says was removed. Returns the number of changes.
 static int log_merge(const uint8_t *b, int len, int from_guest)
+{
+    g_merging = 1;
+    int n = merge(b, len, from_guest);
+    g_merging = 0;
+    // a guest: what our scripts removed and the host's log no longer has is done
+    if (!from_guest)
+        for (int i = 0; i < g_nmine; i++)
+            if (!blob_has(b, len, 0, g_mine[i])) list_drop(g_mine, &g_nmine, i--);
+    return n;
+}
+
+static int merge(const uint8_t *b, int len, int from_guest)
 {
     uint8_t *sm = G_SCRIPTS;
     if (!sm || len < 10 || memcmp(b, "QL1", 4)) return 0;
@@ -287,13 +329,14 @@ static int log_merge(const uint8_t *b, int len, int from_guest)
         // a failed task comes from the host only: a joining player's copy of the world can run out a
         // task's time on its own (it was in a base, it rejoined) and must not fail it for everybody
         if (from_guest && strstr(name, ".FAIL")) continue;
+        if (!from_guest && in_list_of(g_mine, g_nmine, name) >= 0) continue;   // we removed it; the host will too
         g_from_host = !from_guest;
         CALL(A_SET_FLAG, str_fn)(sm, name);           // flag (".COMPLETE" / ".FAIL" show the result)
         g_from_host = 0;
         added++;
     }
-    // the host's removed flags (a guest's log has none)
-    int nr = !from_guest && pos + 2 <= len ? *(const uint16_t *)(b + pos) : 0;
+    // removed flags: the host's, or a guest's own scripts' (the host's list passes them on)
+    int nr = pos + 2 <= len ? *(const uint16_t *)(b + pos) : 0;
     pos += 2;
     for (int i = 0; i < nr && pos < len; i++) {
         int l = b[pos++];
@@ -305,7 +348,7 @@ static int log_merge(const uint8_t *b, int len, int from_guest)
         if (!has_flag(name)) continue;
         CALL(A_REMOVE_FLAG, str_fn)(sm, name);
         static int nlog;
-        if (nlog++ < 20) mlog("questlog: '%s' removed (as on the host)", name);
+        if (nlog++ < 40) mlog("questlog: '%s' removed (as on player %d)", name, from_guest ? g_pending_from : 0);
         added++;
     }
     // task timers (after the tasks and flags: a timer goes with a task we have and that still runs)
@@ -413,11 +456,12 @@ static void announce(const uint8_t *b, int len)
     net_send(NET_ALL, MSG_SAY_, msg, (int)strlen(msg) + 1, 1);
 }
 
-// our changes go out at once, in flight, in bases and in dialogues
-static void send_changes(void)
+// our changes go out at once in flight (menu loops can't read the quest data: they also run while a
+// save loads), so what changed in a base or a dialogue goes out when we fly again
+static void send_changes(int force)
 {
     DWORD now = GetTickCount();
-    if (now - g_last_tick < 500) return;
+    if (!force && now - g_last_tick < 500) return;
     g_last_tick = now;
     int len;
     uint8_t *b = log_save(&len);
@@ -438,11 +482,16 @@ static void send_changes(void)
 void questlog_frame(void)
 {
     if (net_mode() == NET_OFF || !coop_in_flight()) return;
-    if (g_pending) {                                  // others' progress: merged in flight only
-        int n = log_merge(g_pending, g_pending_len, net_mode() == NET_HOST);
-        if (n) mlog("questlog: %d entries from player %d", n, g_pending_from);
-        free(g_pending);
-        g_pending = NULL;
+    for (int p = 0; p < NET_MAX_PEERS; p++) {         // others' progress: merged in flight only
+        if (!g_pending[p]) continue;
+        // A guest's own changes first: after the merge the whole log counts as the host's (g_known),
+        // and what we did in a base (visits, briefings, removed flags) never went up.
+        if (net_mode() == NET_CLIENT) send_changes(1);
+        g_pending_from = p;
+        int n = log_merge(g_pending[p], g_pending_len[p], net_mode() == NET_HOST);
+        if (n) mlog("questlog: %d entries from player %d", n, p);
+        free(g_pending[p]);
+        g_pending[p] = NULL;
         if (n) {
             int len;
             uint8_t *b = log_save(&len);
@@ -452,14 +501,7 @@ void questlog_frame(void)
             }
         }
     }
-    send_changes();
-}
-
-// in bases and dialogues (the menu loops): send our changes
-void questlog_menu_tick(void)
-{
-    if (net_mode() == NET_OFF || !G_SCRIPTS || !G_APP || *(int *)(G_APP + APP_MODE) == 0) return;
-    send_changes();
+    send_changes(0);
 }
 
 void questlog_peer_joined(int peer)
@@ -473,18 +515,22 @@ int questlog_handle(int type, int from, const uint8_t *data, int len)
 {
     if (type != MSG_LOG && type != MSG_LOG_UP) return 0;
     if ((type == MSG_LOG && net_mode() != NET_CLIENT) || (type == MSG_LOG_UP && net_mode() != NET_HOST)) return 1;
-    free(g_pending);
-    g_pending = malloc(len);
-    memcpy(g_pending, data, len);
-    g_pending_len = len;
-    g_pending_from = from;
+    if (from < 0 || from >= NET_MAX_PEERS) return 1;
+    // a player's newer log has all of its older one; another player's must not replace it while we
+    // aren't flying (the host in a base gets every guest's)
+    free(g_pending[from]);
+    g_pending[from] = malloc(len);
+    memcpy(g_pending[from], data, len);
+    g_pending_len[from] = len;
     return 1;
 }
 
 void questlog_reset(void)
 {
-    free(g_pending);
-    g_pending = NULL;
+    for (int p = 0; p < NET_MAX_PEERS; p++) {
+        free(g_pending[p]);
+        g_pending[p] = NULL;
+    }
     g_known = 0;
     set_prev(NULL, 0);
     removed_reset();
@@ -504,7 +550,25 @@ static void THISCALL set_flag(void *sm, const char *name)
         coop_notify(aim1_ui("ql_fail_host"));
         return;
     }
+    if (net_mode() == NET_CLIENT && !g_merging && name) {         // set again here: no longer ours to remove
+        int k = in_list_of(g_mine, g_nmine, name);
+        if (k >= 0) list_drop(g_mine, &g_nmine, k);
+    }
     o_set_flag(sm, name);
+}
+
+// REMOVEEVENT on a guest: what its own scripts remove goes up with its log (see g_mine)
+static str_fn o_remove_flag;
+
+static void THISCALL remove_flag(void *sm, const char *name)
+{
+    if (net_mode() == NET_CLIENT && !g_merging && name && sm == G_SCRIPTS && has_flag(name) &&
+        in_list_of(g_mine, g_nmine, name) < 0) {
+        list_add(&g_mine, &g_nmine, name);
+        static int nlog;
+        if (nlog++ < 40) mlog("questlog: '%s' removed here - telling the host", name);
+    }
+    o_remove_flag(sm, name);
 }
 
 // Dropping the guest's ".FAIL" flag left the rest of the failing script block running there - its
@@ -676,6 +740,9 @@ void questlog_install(void)
     o_run_block = (runblock_fn)hook_jmp(A_RUN_BLOCK, pro, 5, (void *)h_run_block);
     mlog("questlog: guest task failures %s", o_set_flag && o_run_block ? "left to the host (flag and script block)" :
                                              "NOT handled (unexpected code)");
+    static const uint8_t rpro[5] = {0x8b, 0x44, 0x24, 0x04, 0x56};          // mov eax, [esp+4]; push esi
+    o_remove_flag = (str_fn)hook_jmp(A_REMOVE_FLAG, rpro, sizeof rpro, (void *)remove_flag);
+    mlog("questlog: guests' removed flags %s", o_remove_flag ? "shared" : "NOT shared (unexpected code)");
 }
 
 // harness: "qldump", "qladd <quest>"
@@ -689,9 +756,23 @@ void questlog_test(const char *cmd, const char *arg)
         uint8_t *b = log_save(&len);
         int nfl = 0;
         const char *fl;
-        for (int i = 0; (fl = flag_name(i, &nfl)) != NULL; i++)
+        // "set": the same tasks, journal entries and flags, in whatever order they came (two players' logs)
+        uint32_t set = 0;
+        char x[0x80];
+        for (int i = 0; (fl = flag_name(i, &nfl)) != NULL; i++) {
             if (!strcmp(arg, "flags")) mlog("  flag %s", fl);
-        mlog("questlog: %d quests, %d journal entries, %d flags (hash %08x)", nq, nj, nfl, b ? hash(b, len) : 0);
+            snprintf(x, sizeof x, "f:%s", fl);
+            set ^= hash((const uint8_t *)x, (int)strlen(x));
+        }
+        for (int i = 0; i < nq; i++) {
+            snprintf(x, sizeof x, "q:%.80s", (const char *)*(uint8_t **)(sm + SM_QUEST_P) + i * QUEST_SIZE);
+            set ^= hash((const uint8_t *)x, (int)strlen(x));
+        }
+        for (int i = 0; i < nj; i++) {
+            snprintf(x, sizeof x, "j:%.32s", (const char *)*(uint8_t **)(sm + SM_JOURNAL_P) + i * JOURNAL_SIZE);
+            set ^= hash((const uint8_t *)x, (int)strlen(x));
+        }
+        mlog("questlog: %d quests, %d journal entries, %d flags (hash %08x, set %08x)", nq, nj, nfl, b ? hash(b, len) : 0, set);
         free(b);
         for (int i = 0; i < nq; i++) {
             const char *q = (const char *)*(uint8_t **)(sm + SM_QUEST_P) + i * QUEST_SIZE;
