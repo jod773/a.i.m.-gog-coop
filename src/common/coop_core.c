@@ -615,6 +615,12 @@ void coop_menu_poll(void)
     g_coop_menu = 0;
 }
 
+// A.I.M.'s base screen is a modal loop: coop_frame doesn't run there, so it never saw us leave the
+// flight and our pilot data didn't go out after a base visit (#15's shop changes; a revived host
+// stayed invisible). The game says when we were out; the next flight frame is a return to flight.
+static int g_was_fly;
+void coop_left_flight(void) { g_was_fly = 0; }
+
 // ---- personal pilot -----------------------------------------------------------------------
 // A joining player loads the host's world, which contains the host's pilot.
 // Each player keeps their own (glider, equipment, money) in a profile file
@@ -878,11 +884,10 @@ void coop_frame(void)
     chat_frame();
     follow_pilot_name();
     coop_poll();
-    static int was_fly;
     if (net_mode() != NET_OFF) {
         int fly = cg_in_flight();
-        int back_in_flight = fly && !was_fly;
-        was_fly = fly;
+        int back_in_flight = fly && !g_was_fly;
+        g_was_fly = fly;
         if (back_in_flight && g_mech_gen == g_world_gen) {
             // out of a base (same world): its shop may have changed our glider or guns (#15)
             send_mech(NET_ALL);

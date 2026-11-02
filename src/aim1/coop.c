@@ -151,6 +151,11 @@ void coop_remove_glider(uint8_t *g)
             if (*(uint8_t **)(o + 0xb98) == g) *(uint8_t **)(o + 0xb98) = NULL;
         }
     }
+    // a dead player's camera watching it (respawn.c): the camera's "look at" object (+0x2cc, read every
+    // frame in modes 1 / 3 / 4) and the death camera's (0x677e00) - our own glider instead
+    uint8_t *cam = *(uint8_t **)0x00677dfc;
+    if (cam && *(uint8_t **)(cam + 0x2cc) == g) *(uint8_t **)(cam + 0x2cc) = G_PLAYER_GLIDER;
+    if (*(uint8_t **)0x00677e00 == g) *(uint8_t **)0x00677e00 = G_PLAYER_GLIDER;
     g[OBJ_ALIVE] = 0;        // CObjectList::Pack deletes it
 }
 
@@ -375,6 +380,7 @@ static int THISCALL base_modal(void *menu, int a)
     g_world_ran = 0;
     int r = CALL(0x0042d5e0, domodal_fn)(menu, a);
     g_in_base = 0;
+    coop_left_flight();              // our glider / guns may have changed here: they go out on fly-out
     if (g_world_ran) mlog("coop: the world ran while we were in the base");
     return r;
 }

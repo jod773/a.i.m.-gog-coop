@@ -83,6 +83,7 @@ static void delete_thing(uint8_t *o)
 {
     if (G_PLAYER_GLIDER && *(uint8_t **)(G_PLAYER_GLIDER + GLIDER_TARGET) == o)
         *(uint8_t **)(G_PLAYER_GLIDER + GLIDER_TARGET) = NULL;
+    if (DEATH_CAM_TARGET == o) DEATH_CAM_TARGET = G_PLAYER_GLIDER;     // a dead player's camera followed it
     typedef void (THISCALL *del_fn)(void *, void *);
     CALL(A_OBJLIST_DEL, del_fn)((void *)A_OBJECT_LIST, o);
 }
@@ -132,6 +133,7 @@ static void host_scan(void)
             g_t[id].obj = o;
             g_t[id].gen = gen;
             memcpy(g_t[id].pos, o + OBJ_POS, sizeof g_t[id].pos);
+            respawn_new_thing(o);             // our own mechmind while we are down: named after us, ours only
             send_add(NET_ALL, id);
         } else {
             const float *p = (const float *)(o + OBJ_POS);

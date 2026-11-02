@@ -23,6 +23,7 @@ void coop_frame(void);                // every frame of the flight loop, before 
 void coop_menu_poll(void);            // from menu loops: keep the session alive
 void coop_show_version(int on);       // the mod's version in the main menu's corner
 void coop_menu_keepalive(void);       // from a panel opened in flight (hold, journal, ESC): keep our glider shown
+void coop_left_flight(void);          // the flight loop stopped (a base screen): the next flight frame sends our pilot
 void coop_world_tick(void);           // the world runs outside the flight loop: drive the other players' gliders
 void coop_poll(void);
 int coop_host(void);

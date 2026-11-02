@@ -15,7 +15,9 @@
 // links the mechmind its copy of a dead teammate dropped; when the local player picks it up and
 // enters a building (CBuildingObject::Run sets 0x677124 = 1, name at 0x677128), MSG_RESPAWN tells
 // the dead player, who asks the host for the world again (MSG_WORLD_REQ) - the same path as a
-// rejoin: the host's world with our own pilot from the profile, next to the host, alive.
+// rejoin: the host's world with our own pilot from the profile, alive, in that building. A dead host
+// comes back in its own world as it is (revive_host). The game's death sequence (and its way back to
+// the main menu) runs only once nobody is left up.
 #include "coop.h"
 #include "../common/net.h"
 #include <math.h>
@@ -88,6 +90,9 @@ typedef struct {
     DWORD t;
     uint8_t *thing;               // their mechmind here (checked against the object list before use)
     float pos[3];
+    char mind[32];                // its goods' name (the player's; another pilot's if linked by "any")
+    uint8_t *old[64];             // the mechminds already lying here when they went down: not theirs
+    int nold;
 } fallen;
 static fallen g_fallen[NET_MAX_PEERS];
 
@@ -150,23 +155,52 @@ void respawn_player_down(int peer, const char *name, const uint8_t *puppet)
     lstrcpynA(f->name, name, sizeof f->name);
     memcpy(f->at, puppet + OBJ_POS, sizeof f->at);
     f->t = GetTickCount();
+    for (void **nd = *(void ***)(A_OBJECT_LIST + OBJLIST_HEAD); nd && f->nold < 64; nd = (void **)nd[1]) {
+        uint8_t *o = (uint8_t *)nd[0];
+        if (o && *(int *)(o + OBJ_TYPE) == TYPE_THING && *(int *)(o + THING_KIND) == KIND_MECHMIND) f->old[f->nold++] = o;
+    }
+    mlog("respawn: %s went down at %.0f %.0f %.0f", f->name, f->at[0], f->at[1], f->at[2]);
 }
 
-static void link_mechmind(fallen *f)
+// The host's own mechmind, as a new thing of the host's world goes out to the guests (loot.c). A guest's
+// is named after the guest (their puppet's pilot), the host's after the host's pilot in the world
+// ("SMT5001"), which a guest can't tell from anyone's: named after the host here. And it lies in the
+// host's world, where a passing NPC took it within a minute: ours to take only (only the local player's
+// glider picks up a player-only thing, and not while dead) - a guest's pickup comes as MSG_THING_TAKEN.
+void respawn_new_thing(uint8_t *t)
+{
+    uint8_t *mo = our_mechanoid();
+    if (net_mode() != NET_HOST || !mo || !player_dead() || *(int *)(t + THING_KIND) != KIND_MECHMIND ||
+        *(int *)(t + 0x40c) < 1)
+        return;
+    char *nm = (char *)t + 0x27c + 4;
+    if (lstrcmpiA(nm, (const char *)mo)) return;
+    memset(nm, 0, 32);
+    lstrcpynA(nm, coop_my_name(), 32);
+    t[THING_PLAYER_ONLY] = 1;
+    const float *p = (const float *)(t + OBJ_POS);
+    mlog("respawn: our mechmind (pilot %.31s) is lying at %.0f %.0f %.0f", (const char *)mo, p[0], p[1], p[2]);
+}
+
+// any: no mechmind named after them came up - the nearest one that came up since will do
+static void link_mechmind(fallen *f, int any)
 {
     uint8_t *best = NULL;
-    float bd = 80.0f * 80.0f;
+    float bd = 400.0f * 400.0f;
     for (void **nd = *(void ***)(A_OBJECT_LIST + OBJLIST_HEAD); nd; nd = (void **)nd[1]) {
         uint8_t *o = (uint8_t *)nd[0];
         if (!o || !o[OBJ_ALIVE] || *(int *)(o + OBJ_TYPE) != TYPE_THING || *(int *)(o + THING_KIND) != KIND_MECHMIND) continue;
         int taken = 0;
         for (int i = 0; i < NET_MAX_PEERS; i++) taken |= g_fallen[i].used && g_fallen[i].thing == o;
         float d = dist2((float *)(o + OBJ_POS), f->at);
-        // the dead player's own mechmind (its goods are named after the pilot): a hold full of
-        // other mechminds drops with it, and the nearest one was often someone else's (#24)
+        // the dead player's own mechmind (its goods are named after the player - the host's too, see
+        // respawn_new_thing): a hold full of other mechminds drops with it, and the nearest one was
+        // often someone else's (#24). They land where they land, often over 80 away.
         int own = *(int *)(o + 0x40c) > 0 && !lstrcmpiA((const char *)o + 0x27c + 4, f->name);
-        if (own && !taken && d < 300.0f * 300.0f) { best = o; break; }
-        if (!taken && d < bd) { bd = d; best = o; }
+        if (own && !taken && d < 400.0f * 400.0f) { best = o; break; }
+        int fresh = any;
+        for (int i = 0; i < f->nold; i++) fresh &= f->old[i] != o;
+        if (!taken && fresh && d < bd) { bd = d; best = o; }
     }
     if (!best) return;
     f->thing = best;
@@ -174,6 +208,7 @@ static void link_mechmind(fallen *f)
     // deliver from: the dead player could not be brought back. Ours to take (local player) only.
     best[THING_PLAYER_ONLY] = 1;
     memcpy(f->pos, best + OBJ_POS, sizeof f->pos);
+    lstrcpynA(f->mind, *(int *)(best + 0x40c) > 0 ? (const char *)best + 0x27c + 4 : f->name, sizeof f->mind);
     mlog("respawn: %s's mechmind is lying at %.0f %.0f %.0f", f->name, f->pos[0], f->pos[1], f->pos[2]);
 }
 
@@ -193,9 +228,16 @@ static void track_mechminds(int can_pick)
         }
         if (f->carried) continue;
         if (!f->thing) {
-            if (GetTickCount() - f->t < 15000) link_mechmind(f);
+            // the player's own glider drops its mechmind seconds after the explosion (8-9 s seen)
+            DWORD dt = GetTickCount() - f->t;
+            if (dt < 30000) link_mechmind(f, dt > 20000);
             else {
                 mlog("respawn: no mechmind of %s found here", f->name);
+                for (void **nd = *(void ***)(A_OBJECT_LIST + OBJLIST_HEAD); nd; nd = (void **)nd[1]) {
+                    uint8_t *o = (uint8_t *)nd[0];
+                    if (o && o[OBJ_ALIVE] && *(int *)(o + OBJ_TYPE) == TYPE_THING && *(int *)(o + THING_KIND) == KIND_MECHMIND)
+                        mlog("respawn:   mechmind '%.31s' %.0f away", (const char *)o + 0x27c + 4, sqrtf(dist2((float *)(o + OBJ_POS), f->at)));
+                }
                 memset(f, 0, sizeof *f);
             }
             continue;
@@ -206,7 +248,7 @@ static void track_mechminds(int can_pick)
             f->carried = 1;
             uint8_t *e;
             for (int k = 0; (e = goods_entry(k)) != NULL; k++)
-                if (!lstrcmpiA((const char *)e + 4, f->name)) g_mind_kind = *(int *)e;
+                if (!lstrcmpiA((const char *)e + 4, f->mind)) g_mind_kind = *(int *)e;
             mlog("respawn: we picked up %s's mechmind (goods kind %d)", f->name, g_mind_kind);
             char msg[160];
             snprintf(msg, sizeof msg, aim1_ui("mind_picked"), f->name);
@@ -232,7 +274,7 @@ static void deliver(void)
         lstrcpynA(m + 32, where, 32);
         net_send(NET_ALL, MSG_RESPAWN, m, sizeof m, 1);
         mlog("respawn: %s's mechmind delivered to %s - told them", f->name, where);
-        remove_mechmind(f->name);
+        remove_mechmind(f->mind[0] ? f->mind : f->name);
         char msg[160];
         snprintf(msg, sizeof msg, aim1_ui("mind_delivered"), f->name);
         coop_notify(msg);
@@ -249,6 +291,50 @@ void respawn_base_entered(void)
     if (*(int *)A_LEAVE_GAME == 1) deliver();
 }
 
+// ---- the host comes back -------------------------------------------------------------------------
+// A guest comes back by loading the host's world again. The world is the host's own, so the host
+// comes back in it as it is - a reload would pull every guest out of what they are doing. Undone is
+// what the death did: CGlider::Run (0x4f9b80) marked the player's glider dying (+0x10d0), stopped its
+// movement (+0x5a) and hid it (+0x5f); the death event (0x41ce10) set "<pilot>.KILLED"; ProcessInput's
+// death branch (0x4203a0) started the death camera once (app +0x144), turned the camera to "look at"
+// mode (0x677e04 = 3: the rest of ProcessInput takes it for a free camera) and darkened the picture.
+// The glider then flies into the building our mechmind was brought to: the base screen, and flying
+// out of it puts everything else (camera, position) right as after any base visit.
+#define G_CAMERA          (*(uint8_t **)0x00677dfc)
+#define APP_DEATH_CAM     0x144                      // byte: the death camera was started
+#define OBJ_MOVE_ON       0x5a                       // CObjectList::PreMove / Move move it
+#define A_CAM_COCKPIT     0x0041b000                 // thiscall(camera, glider): cockpit view, camera mode 0
+#define A_REMOVE_FLAG     0x0043a660                 // thiscall(script manager, name): REMOVEEVENT
+#define A_FADE_BACK       0x00497c00                 // the picture back from the death fade
+
+static int revive_host(const char *where)
+{
+    uint8_t *g = G_PLAYER_GLIDER, *mo = our_mechanoid(), *app = G_APP, *cam = G_CAMERA;
+    if (!g || !mo || !app || !cam || !g[OBJ_ALIVE]) return 0;
+    typedef void (THISCALL *mo_fn)(uint8_t *);
+    typedef void (THISCALL *cam_fn)(uint8_t *, uint8_t *);
+    typedef void (THISCALL *str_fn)(void *, const char *);
+    typedef void (__cdecl *v_fn)(void);
+    typedef int (THISCALL *flag_find_fn)(void *, const char *);
+    mo[0x74] = mo[0xac] = mo[0x154] = 0;
+    CALL(A_MECHANOID_REPAIR, mo_fn)(mo);
+    g[GLIDER_DYING] = 0;
+    g[OBJ_MOVE_ON] = 1;
+    app[APP_DEATH_CAM] = 0;
+    *(float *)(app + APP_DEATH_TIMER) = 0.0f;
+    DEATH_CAM_TARGET = NULL;
+    CALL(A_CAM_COCKPIT, cam_fn)(cam, g);
+    CALL(A_FADE_BACK, v_fn)();
+    uint8_t *sm = *(uint8_t **)A_TEXT_DB_PTR;
+    char killed[48];
+    snprintf(killed, sizeof killed, "%.31s.KILLED", (const char *)mo);
+    if (sm && CALL(0x00404620, flag_find_fn)(sm + 0xbd4, killed) != -1) CALL(A_REMOVE_FLAG, str_fn)(sm, killed);
+    int ok = aim1_enter_building(where);
+    if (!ok) coop_left_flight();     // flying on from here: our pilot goes out again (the others dropped our glider)
+    mlog("respawn: we are the host - back in our own world%s%s%s", ok ? ", into " : " (no building ", where, ok ? "" : ")");
+    return 1;
+}
+
 int respawn_handle(int type, int from, const uint8_t *data, int len)
 {
     (void)from;
@@ -262,9 +348,12 @@ int respawn_handle(int type, int from, const uint8_t *data, int len)
         return 1;
     }
     if (!G_PLAYER_GLIDER || !player_dead()) { mlog("respawn: mechmind delivered to %s, but we are not down", where); return 1; }
-    if (net_mode() != NET_CLIENT) {
-        mlog("respawn: our mechmind was delivered to %s - the host's respawn is not built yet", where);
-        coop_notify(aim1_ui("respawn_host"));
+    if (net_mode() == NET_HOST) {
+        if (g_coop_menu || !revive_host(where)) {                // (in flight: the dead host's flight loop runs)
+            mlog("respawn: our mechmind was delivered to %s - can't come back from here", where);
+            return 1;
+        }
+        coop_notify(aim1_ui("respawning"));
         return 1;
     }
     if (g_world_asked) return 1;
@@ -396,6 +485,25 @@ static void spectator_camera(void)
     }
 }
 
+// our own mechmind here - named after us (respawn_new_thing; a guest sees the host's copy of it, named
+// after the guest's puppet) or after our pilot - else our wreck: what the death camera follows
+static uint8_t *own_remains(void)
+{
+    uint8_t *best = G_PLAYER_GLIDER, *mo = our_mechanoid();
+    float bd = 2000.0f * 2000.0f;
+    for (void **nd = *(void ***)(A_OBJECT_LIST + OBJLIST_HEAD); nd; nd = (void **)nd[1]) {
+        uint8_t *o = (uint8_t *)nd[0];
+        if (!o || !o[OBJ_ALIVE] || *(int *)(o + OBJ_TYPE) != TYPE_THING || *(int *)(o + THING_KIND) != KIND_MECHMIND ||
+            *(int *)(o + 0x40c) < 1)
+            continue;
+        const char *nm = (const char *)o + 0x27c + 4;
+        if (lstrcmpiA(nm, coop_my_name()) && (!mo || lstrcmpiA(nm, (const char *)mo))) continue;
+        float d = dist2((float *)(o + OBJ_POS), (float *)(G_PLAYER_GLIDER + OBJ_POS));
+        if (d < bd) { bd = d; best = o; }
+    }
+    return best;
+}
+
 static void THISCALL h_process_input(uint8_t *app)
 {
     if (net_mode() != NET_OFF && G_PLAYER_GLIDER && *(int *)(app + APP_MODE) != 0 && player_dead()) {
@@ -419,9 +527,19 @@ static void THISCALL h_process_input(uint8_t *app)
                 coop_notify(aim1_ui("down_hint"));
             }
         } else if (g_spectating) {
+            // Everyone is down: the game's death sequence over our own mechmind, from its start. The
+            // camera looked at a teammate's puppet (exploded, about to be freed): back on our glider,
+            // as the death branch started it. With nothing to follow (0x677e00 NULL) the game jumps to
+            // the sequence's last 2 s - it ended at once.
             g_spectating = 0;
-            DEATH_CAM_TARGET = NULL;                  // it may be a puppet that is gone now
-            mlog("respawn: nobody left alive - the game's death sequence goes on");
+            if (G_CAMERA) {
+                typedef void (THISCALL *look_fn)(uint8_t *, uint8_t *);
+                CALL(A_CAM_LOOK_AT, look_fn)(G_CAMERA, G_PLAYER_GLIDER);
+            }
+            DEATH_CAM_TARGET = own_remains();
+            *(float *)(app + APP_DEATH_TIMER) = 0.0f;
+            mlog("respawn: nobody left alive - the game's death sequence goes on (over %s)",
+                 DEATH_CAM_TARGET == G_PLAYER_GLIDER ? "our wreck" : "our mechmind");
             coop_notify(aim1_ui("all_down"));
         }
     } else if (g_spectating) {
