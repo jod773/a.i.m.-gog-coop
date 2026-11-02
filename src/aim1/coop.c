@@ -415,9 +415,16 @@ static void base_world_tick(void)
     if (G_PLAYER_GLIDER == pg) pg[OBJ_RUN_ON] = run_on, pg[OBJ_MOVE_ON] = move_on;
     coop_world_tick();               // the guests' gliders
     mirror_base_frame();             // the NPCs to the guests
+    loot_base_frame();               // what was dropped meanwhile
+    respawn_base_frame();            // a teammate's mechmind among it
     g_base_world = 0;
     if (!g_world_ran) mlog("coop: in a base with guests here - the world keeps running");
     g_world_ran = 1;
+}
+
+int coop_base_world_running(void)
+{
+    return g_in_base && g_world_ran && net_mode() == NET_HOST && coop_world_gen() == g_base_gen;
 }
 
 // the fly-out catch-up (see above)

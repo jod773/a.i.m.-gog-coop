@@ -178,7 +178,8 @@ static void link_mechmind(fallen *f)
 }
 
 // in flight, every frame: follow the mechminds; the one that vanishes next to us was picked up by us
-static void track_mechminds(void)
+// (can_pick 0: the host's world ticking in a base - the parked glider picks nothing up)
+static void track_mechminds(int can_pick)
 {
     static DWORD last;
     if (GetTickCount() - last < 200) return;
@@ -201,7 +202,7 @@ static void track_mechminds(void)
         }
         if (thing_present(f->thing)) { memcpy(f->pos, f->thing + OBJ_POS, sizeof f->pos); continue; }
         f->thing = NULL;
-        if (G_PLAYER_GLIDER && !player_dead() && dist2((float *)(G_PLAYER_GLIDER + OBJ_POS), f->pos) < 60.0f * 60.0f) {
+        if (can_pick && G_PLAYER_GLIDER && !player_dead() && dist2((float *)(G_PLAYER_GLIDER + OBJ_POS), f->pos) < 60.0f * 60.0f) {
             f->carried = 1;
             uint8_t *e;
             for (int k = 0; (e = goods_entry(k)) != NULL; k++)
@@ -317,8 +318,15 @@ void respawn_frame(void)
             g_respawn_seen = 0;
         }
     }
-    track_mechminds();
+    track_mechminds(1);
     drop_stale_mechminds();
+}
+
+// the host's world ticked while the host is in a base (coop.c, #37): a teammate who died meanwhile
+// dropped their mechmind there - link it now (the link waits only 15 s), mark it player-only
+void respawn_base_frame(void)
+{
+    if (net_mode() == NET_HOST) track_mechminds(0);
 }
 
 void respawn_reset(void)
