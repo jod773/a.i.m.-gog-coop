@@ -1,6 +1,7 @@
-// Text drawn over the game's picture (the chat line being typed), through the game's own
+// Text drawn over the game's picture (the chat line being typed, notices while the game draws no HUD,
+// the version in the main menu), through the game's own
 // Direct3D 8 device just before it presents a frame. The font is drawn once by GDI into a
-// texture (ASCII 32-126 and cp1251 192-255, 16 x 14 cells).
+// texture (ASCII 32-126 and cp1251 192-255, 16 cells a row).
 #include "util.h"
 #include <string.h>
 
@@ -12,9 +13,9 @@ enum { D_GETBACKBUFFER = 16, D_CREATETEXTURE = 20, D_BEGINSCENE = 34, D_ENDSCENE
        D_GETVIEWPORT = 41, D_SETRS = 50, D_GETRS = 51, D_GETTEXTURE = 60, D_SETTEXTURE = 61, D_GETTSS = 62,
        D_SETTSS = 63, D_DRAWUP = 72, D_SETVS = 76, D_GETVS = 77 };
 
-#define CW 16
+#define CW 24                         // wide enough for 'm' / 'W' (16 cut them: "teammate" read "tearrmate")
 #define CH 28
-#define TEXW 256
+#define TEXW 512
 #define TEXH 512                      // 16 x 18 cells
 static void *g_font, *g_font_dev;
 static unsigned char g_adv[256];
@@ -114,6 +115,25 @@ void overlay_set_corner(const char *text)
     LeaveCriticalSection(&g_cs);
 }
 
+// notices (chat, co-op events) while the game draws no HUD of its own (A.I.M.: a dead player watching
+// a teammate): the last few, above the chat line, each for 10 s
+#define NOTE_N  5
+#define NOTE_MS 10000
+static char g_note[NOTE_N][128];      // oldest first
+static DWORD g_note_t[NOTE_N];
+static volatile DWORD g_note_newest;
+
+void overlay_notice(const char *text)
+{
+    lock();
+    memmove(g_note[0], g_note[1], sizeof g_note[0] * (NOTE_N - 1));
+    memmove(g_note_t, g_note_t + 1, sizeof g_note_t[0] * (NOTE_N - 1));
+    lstrcpynA(g_note[NOTE_N - 1], text, sizeof g_note[0]);
+    g_note_t[NOTE_N - 1] = GetTickCount();
+    g_note_newest = g_note_t[NOTE_N - 1];
+    LeaveCriticalSection(&g_cs);
+}
+
 static float text_width(const char *s, float sc)
 {
     float w = 0;
@@ -140,12 +160,17 @@ static int glyphs(vtx *v, int max, const char *s, float x, float y, float sc, DW
 // called with the game's device right before Present
 void overlay_draw(void *dev)
 {
-    if ((!g_show && !g_corner_show) || !dev) return;
-    char line[160], corner[96];
+    DWORD now = GetTickCount();
+    int notes = now - g_note_newest < NOTE_MS;
+    if ((!g_show && !g_corner_show && !notes) || !dev) return;
+    char line[160], corner[96], note[NOTE_N][128];
+    int nnote = 0;
     lock();
     int show = g_show, show_corner = g_corner_show;
     lstrcpynA(line, show ? g_line : "", sizeof line);
     lstrcpynA(corner, show_corner ? g_corner : "", sizeof corner);
+    for (int i = 0; i < NOTE_N; i++)
+        if (g_note_t[i] && now - g_note_t[i] < NOTE_MS) lstrcpynA(note[nnote++], g_note[i], sizeof note[0]);
     LeaveCriticalSection(&g_cs);
     if (!make_font(dev)) return;
 
@@ -153,18 +178,24 @@ void overlay_draw(void *dev)
     FN(dev, D_GETVIEWPORT, HR (WINAPI *)(void *, void *))(dev, &vp);
     float sc = vp.h >= 1000 ? 1.0f : vp.h / 1080.0f + 0.15f;
     float x = vp.x + 40.0f, y = vp.y + vp.h * 0.70f;
-    static vtx v[6 * 260];
-    int n = 0;
-    // the chat line's box (drawn untextured: the font has no solid white area)
-    vtx box[6];
+    static vtx v[6 * (260 + NOTE_N * 128)];
+    int n = 0, nbox = 0;
+    // the boxes behind the text (drawn untextured: the font has no solid white area)
+    vtx box[6 * (1 + NOTE_N)];
     if (show) {
         quad(box, x - 10, y - 6, x + text_width(line, sc) + 24, y + CH * sc + 4, 0xa0000000, 0, 0, 0, 0);
+        nbox++;
         n += glyphs(v + n, 6 * 160, line, x, y, sc, 0xffffffff);
+    }
+    for (int i = nnote - 1, k = 1; i >= 0; i--, k++) {          // newest right above the chat line
+        float ny = y - k * (CH * sc + 12);
+        nbox += quad(box + nbox * 6, x - 10, ny - 6, x + text_width(note[i], sc) + 24, ny + CH * sc + 4, 0x80000000, 0, 0, 0, 0) / 6;
+        n += glyphs(v + n, (int)(sizeof v / sizeof v[0]) - n - 6 * 100, note[i], x, ny, sc, 0xffe8e8a0);
     }
     if (show_corner) {           // bottom right, small and dim
         float cs = sc * 0.7f;
         float cx = vp.x + vp.w - text_width(corner, cs) - 16.0f, cy = vp.y + vp.h - CH * cs - 10.0f;
-        n += glyphs(v + n, 6 * 260 - n, corner, cx, cy, cs, 0xc0d0d0d0);
+        n += glyphs(v + n, (int)(sizeof v / sizeof v[0]) - n, corner, cx, cy, cs, 0xc0d0d0d0);
     }
 
     static const DWORD rs[] = {7, 14, 15, 22, 27, 28, 137, 19, 20};   // z, zwrite, alphatest, cull, blend, fog, lighting, src, dst
@@ -186,7 +217,7 @@ void overlay_draw(void *dev)
     FN(dev, D_SETTEXTURE, HR (WINAPI *)(void *, DWORD, void *))(dev, 0, NULL);
     FN(dev, D_SETTSS, HR (WINAPI *)(void *, DWORD, DWORD, DWORD))(dev, 0, 1, 3);     // select diffuse
     FN(dev, D_SETTSS, HR (WINAPI *)(void *, DWORD, DWORD, DWORD))(dev, 0, 4, 3);
-    if (show) FN(dev, D_DRAWUP, HR (WINAPI *)(void *, DWORD, UINT, const void *, UINT))(dev, 4, 2, box, sizeof box[0]);
+    if (nbox) FN(dev, D_DRAWUP, HR (WINAPI *)(void *, DWORD, UINT, const void *, UINT))(dev, 4, nbox * 2, box, sizeof box[0]);
     FN(dev, D_SETTSS, HR (WINAPI *)(void *, DWORD, DWORD, DWORD))(dev, 0, 1, 4);
     FN(dev, D_SETTSS, HR (WINAPI *)(void *, DWORD, DWORD, DWORD))(dev, 0, 4, 4);
     FN(dev, D_SETTEXTURE, HR (WINAPI *)(void *, DWORD, void *))(dev, 0, g_font);
