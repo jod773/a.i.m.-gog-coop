@@ -164,6 +164,7 @@ void coop_remove_glider(uint8_t *g)
 
 // ---- adapter for the session core ------------------------------------------------------------
 int cg_in_flight(void) { return coop_in_flight(); }
+int cg_chat_allowed(void) { return coop_in_flight(); }
 int cg_pilot_saveable(void) { return 1; }
 
 int cg_pilot_name(char *out, int n)

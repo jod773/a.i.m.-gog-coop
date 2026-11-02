@@ -849,7 +849,7 @@ static void chat_frame(void)
 {
     if (g_chat_req) {
         g_chat_req = 0;
-        if (net_mode() != NET_OFF && cg_in_flight() && !textinput_active()) {
+        if (net_mode() != NET_OFF && cg_chat_allowed() && !textinput_active()) {
             textinput_start_free("", 90);
             g_chat_typing = 1;
         }
@@ -857,7 +857,7 @@ static void chat_frame(void)
     if (!g_chat_typing) return;
     char t[128], line[160];
     int r = textinput_poll(t, sizeof t);
-    if (r == 0 && cg_in_flight() && net_mode() != NET_OFF) {
+    if (r == 0 && cg_chat_allowed() && net_mode() != NET_OFF) {
         snprintf(line, sizeof line, "%s %s_", cg_text("chat_prompt"), t);
         overlay_set_line(line);
         return;

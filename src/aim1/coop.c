@@ -195,6 +195,8 @@ static void guest_player_name(void)
 
 // ---- adapter for the session core ------------------------------------------------------------
 int cg_in_flight(void) { return coop_in_flight(); }
+// a dead player watching a teammate (respawn.c) still reads and writes the chat
+int cg_chat_allowed(void) { return coop_in_flight() || respawn_spectating(); }
 
 int cg_pilot_saveable(void)                    // not while dying
 {
@@ -270,7 +272,7 @@ void cg_frame(void)
     guest_player_name();
     questlog_frame();
     if (coop_in_flight()) { respawn_frame(); mapmark_frame(); }
-    if (coop_in_flight()) flush_notices();
+    if (cg_chat_allowed()) flush_notices();
 }
 
 void cg_session_started(void) {}

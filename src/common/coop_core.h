@@ -57,6 +57,7 @@ void coop_profile_path(char *out, int n);
 
 // ---- adapter (one per game) ------------------------------------------------------------------
 int cg_in_flight(void);
+int cg_chat_allowed(void);                            // chat can be typed and shown (in flight; A.I.M.: also while spectating)
 uint8_t *cg_pilot_save(int *len);
 int cg_pilot_name(char *out, int n);                  // the local pilot's name (1 if known)                     // the local pilot, serialized (malloc'ed)
 int cg_pilot_saveable(void);                          // not dying etc.
