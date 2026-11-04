@@ -280,7 +280,7 @@ int cg_handle(int type, int from, const uint8_t *data, int len, const char *name
     (void)name;
     return mirror_handle(type, from, data, len) || questlog_handle(type, from, data, len) ||
            respawn_handle(type, from, data, len) || loot_handle(type, from, data, len) ||
-           killcredit_handle(type, from, data, len);
+           killcredit_handle(type, from, data, len) || ending_handle(type, from, data, len);
 }
 
 void cg_frame(void)
@@ -547,6 +547,8 @@ int cg_command(const char *cmd, const char *arg, const char *line)
         mapmark_test();
     } else if ((!strcmp(cmd, "mindstat") || !strcmp(cmd, "pickmind")) && in_flight()) {
         respawn_test(cmd);
+    } else if (!strcmp(cmd, "gameend")) {
+        ending_test(atoi(arg));
     } else if (!strcmp(cmd, "spectcam")) {
         extern int g_spect_cam;
         g_spect_cam = atoi(arg);
@@ -645,4 +647,5 @@ void aim1_coop_install(void)
     mapmark_install();
     killcredit_install();
     loot_install();
+    ending_install();
 }

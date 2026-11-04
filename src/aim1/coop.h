@@ -51,6 +51,11 @@ void respawn_test(const char *cmd);
 void killcredit_install(void);
 int killcredit_handle(int type, int from, const uint8_t *data, int len);
 
+// ending.c: the end of the game reaches every player
+void ending_install(void);
+int ending_handle(int type, int from, const uint8_t *data, int len);
+void ending_test(int n);
+
 // mapmark.c: the other players as pointers on the map screen
 void mapmark_install(void);
 void mapmark_frame(void);
