@@ -16,9 +16,10 @@
 
 #define A_PROCESS     0x00422550      // the scripts' _PROCESS(n): 4 / 5 = the two endings
 #define A_THE_END     0x0041e930      // the win text and the credits
-#define A_GAME_STATE  0x00677124
+#define A_GAME_STATE  0x00677124      // 2 = leave the game, 6 / 7 = the endings
+#define A_GAME_EVENT  0x00677120      // byte: CycleGame acts on the state after this frame
 #define APP_QUIT      0x44
-#define APP_BUILDING  0x2a4           // the open building screen (NULL in flight)
+#define APP_BUILDING  0x2a4           // the open menu (the building screen in a base; NULL in flight)
 
 enum { MSG_GAME_END = 56 };           // int n: the game ends with _PROCESS(n)
 
@@ -34,7 +35,9 @@ static int in_game(void)              // a world is up (flying, in a building or
 
 static void end_here(int n)
 {
-    if (G_APP && *(uint8_t **)(G_APP + APP_BUILDING)) o_process(n);   // in a building: as its script does
+    // in a building: as its script does (app +0x2a4 is any open menu - a panel's in flight - but only the
+    // building's closing leads CycleGame to the credits)
+    if (G_APP && coop_in_base() && *(uint8_t **)(G_APP + APP_BUILDING)) o_process(n);
     else g_pending = n;
 }
 
@@ -65,10 +68,13 @@ void ending_frame(void)
     if (!g_pending || !G_APP) return;
     int n = g_pending;
     g_pending = 0;
-    *(int *)A_GAME_STATE = n == 4 ? 7 : 6;
     mlog("ending: the end of the game (_PROCESS(%d)) - the credits", n);
     CALL(A_THE_END, the_end_fn)(G_APP, n == 4 ? 2 : 1);
-    *(int *)(G_APP + APP_QUIT) = 1;               // then the main menu, as after the game's own ending
+    // then the main menu: "leave the game" as ESC does - CycleGame frees the world after this frame. (The quit
+    // flag alone, set in a frame, makes CycleGame return without that: the game flew on.)
+    *(int *)A_GAME_STATE = 2;
+    *(uint8_t *)A_GAME_EVENT = 1;
+    mlog("ending: credits over - back to the main menu");
 }
 
 int ending_handle(int type, int from, const uint8_t *data, int len)

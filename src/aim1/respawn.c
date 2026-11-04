@@ -509,6 +509,7 @@ static uint8_t *own_remains(void)
 
 static void THISCALL h_process_input(uint8_t *app)
 {
+    ending_frame();                               // the end of the game, from someone else's building
     if (net_mode() != NET_OFF && G_PLAYER_GLIDER && *(int *)(app + APP_MODE) != 0 && player_dead()) {
         int tab = KEYS[DIK_TAB] < 0;
         if (tab && !g_tab_was_down) g_watch++;        // next teammate
@@ -557,7 +558,6 @@ static void THISCALL h_process_input(uint8_t *app)
     o_process_input(app);
     void aim1_debug_after_input(void);
     aim1_debug_after_input();                     // the harness / debug menu's building entry
-    ending_frame();                               // the end of the game, from someone else's building
     if (g_spectating) spectator_camera();
     if (g_spectating && *(int *)A_LEAVE_GAME == 2 && leave != 2) {
         *(int *)A_LEAVE_GAME = leave;

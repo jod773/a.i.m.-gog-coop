@@ -378,6 +378,7 @@ static int THISCALL esc_menu(void *app, void *menu, int a)
 int g_base_world;
 static int g_world_in_base = 1;      // [Coop] HostWorldInBase
 static int g_in_base;                // the base screen is open
+int coop_in_base(void) { return g_in_base; }
 static int g_base_gen;               // the world it was opened in
 static int g_modal_pump;             // menu_pump is called by DoModal's loop (not a loading screen's)
 static int g_world_ran;              // the world ran during this visit
