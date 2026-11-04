@@ -92,6 +92,7 @@ typedef struct {
     uint8_t *thing;               // their mechmind here (checked against the object list before use)
     float pos[3];
     char mind[32];                // its goods' name (the player's; another pilot's if linked by "any")
+    int held0;                    // how many mechminds of that name our hold had when we linked it
     uint8_t *old[64];             // the mechminds already lying here when they went down: not theirs
     int nold;
 } fallen;
@@ -127,6 +128,16 @@ static uint8_t *goods_entry(int i)
 }
 
 static int g_mind_kind = 2;                           // the goods kind of a mechmind (checked again at a pickup)
+
+// how many mechminds named so our hold has
+static int held(const char *name)
+{
+    int n = 0;
+    uint8_t *e;
+    for (int i = 0; (e = goods_entry(i)) != NULL; i++)
+        n += !lstrcmpiA((const char *)e + 4, name) && (g_mind_kind == -1 || *(int *)e == g_mind_kind);
+    return n;
+}
 
 // take a teammate's mechmind out of our hold (delivered, or they are back): 1 if there was one
 static int remove_mechmind(const char *name)
@@ -210,10 +221,31 @@ static void link_mechmind(fallen *f, int any)
     best[THING_PLAYER_ONLY] = 1;
     memcpy(f->pos, best + OBJ_POS, sizeof f->pos);
     lstrcpynA(f->mind, *(int *)(best + 0x40c) > 0 ? (const char *)best + 0x27c + 4 : f->name, sizeof f->mind);
+    f->held0 = held(f->mind);
     mlog("respawn: %s's mechmind is lying at %.0f %.0f %.0f", f->name, f->pos[0], f->pos[1], f->pos[2]);
 }
 
 // in flight, every frame: follow the mechminds; the one that vanishes next to us was picked up by us
+static void carried(fallen *f)
+{
+    f->carried = 1;
+    f->thing = NULL;
+    mlog("respawn: we picked up %s's mechmind (goods kind %d)", f->name, g_mind_kind);
+    char msg[160];
+    snprintf(msg, sizeof msg, aim1_ui("mind_picked"), f->name);
+    coop_notify(msg);
+}
+
+// A pickup puts the mechmind in our hold at once; the thing rises and goes a moment later. Telling a
+// pickup by our glider still being near where it lay failed when we flew into a building within that
+// moment (the check then ran in the base): the teammate was never brought back.
+static int picked_up(fallen *f)
+{
+    if (f->carried || !f->mind[0] || held(f->mind) <= f->held0) return f->carried;
+    carried(f);
+    return 1;
+}
+
 // (can_pick 0: the host's world ticking in a base - the parked glider picks nothing up)
 static void track_mechminds(int can_pick)
 {
@@ -243,17 +275,14 @@ static void track_mechminds(int can_pick)
             }
             continue;
         }
+        if (picked_up(f)) continue;
         if (thing_present(f->thing)) { memcpy(f->pos, f->thing + OBJ_POS, sizeof f->pos); continue; }
         f->thing = NULL;
         if (can_pick && G_PLAYER_GLIDER && !player_dead() && dist2((float *)(G_PLAYER_GLIDER + OBJ_POS), f->pos) < 60.0f * 60.0f) {
-            f->carried = 1;
             uint8_t *e;
             for (int k = 0; (e = goods_entry(k)) != NULL; k++)
                 if (!lstrcmpiA((const char *)e + 4, f->mind)) g_mind_kind = *(int *)e;
-            mlog("respawn: we picked up %s's mechmind (goods kind %d)", f->name, g_mind_kind);
-            char msg[160];
-            snprintf(msg, sizeof msg, aim1_ui("mind_picked"), f->name);
-            coop_notify(msg);
+            carried(f);
         } else {
             mlog("respawn: %s's mechmind is gone (not picked up by us)", f->name);
             memset(f, 0, sizeof *f);
@@ -269,7 +298,7 @@ static void deliver(void)
     lstrcpynA(where, (const char *)A_ENTER_NAME, sizeof where);
     for (int i = 0; i < NET_MAX_PEERS; i++) {
         fallen *f = &g_fallen[i];
-        if (!f->used || !f->carried) continue;
+        if (!f->used || !picked_up(f)) continue;
         char m[64] = {0};
         lstrcpynA(m, f->name, 32);
         lstrcpynA(m + 32, where, 32);
