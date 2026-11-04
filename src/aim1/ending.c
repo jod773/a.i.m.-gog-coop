@@ -1,66 +1,95 @@
 // A.I.M. co-op: the end of the game is everyone's.
 //
-// The story ends with a script's _PROCESS(4) / _PROCESS(5) (0x422550, stdcall(int)): game state 0x677124 = 7 / 6, the
-// event byte 0x677120 and the app's quit flag +0x44. CycleGame (0x4245fa) then shows the win text and the credits
-// (0x41e930) and goes back to the main menu, where coop.c closes the session. Only the player whose script ran it saw the
-// ending: the host's guests were left flying alone in a world nobody hosted any more, and a guest whose copy of the world
-// ran it just left. Now the host sends MSG_GAME_END to everyone before its own ending, and a guest's ending goes to the
-// host first (the host decides the story), which ends the game for everyone.
+// The story ends in a building: its script's _PROCESS(4) / _PROCESS(5) (0x422550, stdcall(int)) sets game state
+// 0x677124 = 7 / 6, the event byte 0x677120, the app's quit flag +0x44 and +0x3e of the open building screen
+// (app +0x2a4, NULL in flight: _PROCESS anywhere else writes through NULL). When that screen closes, CycleGame
+// (0x4245fa) shows the win text and the credits (0x41e930, thiscall(app, 1 = state 6 / 2 = state 7)) and goes back to
+// the main menu, where coop.c closes the session. Only the player whose script ran it saw the ending: the host's guests
+// were left flying alone, and a guest who ended it in its copy of the world just left.
+// Now the host sends MSG_GAME_END to everyone, and a guest's ending goes to the host first (the host decides the story),
+// which ends the game for everyone. A player in a building ends it as its script would; anyone else (flying, in a
+// panel, down) gets the credits at the next frame (ProcessInput, before anything is drawn) and then the main menu.
 #include "coop.h"
 #include "../common/net.h"
 #include <stdlib.h>
 #include <string.h>
 
-#define A_PROCESS 0x00422550          // the scripts' _PROCESS(n): 4 / 5 = the two endings
+#define A_PROCESS     0x00422550      // the scripts' _PROCESS(n): 4 / 5 = the two endings
+#define A_THE_END     0x0041e930      // the win text and the credits
+#define A_GAME_STATE  0x00677124
+#define APP_QUIT      0x44
+#define APP_BUILDING  0x2a4           // the open building screen (NULL in flight)
 
 enum { MSG_GAME_END = 56 };           // int n: the game ends with _PROCESS(n)
 
 typedef char (__stdcall *process_fn)(int);
+typedef void (THISCALL *the_end_fn)(uint8_t *, int);
 static process_fn o_process;
+static int g_pending;                 // an ending to show at the next frame
 
-static int in_game(void)            // a world is up (flying, in a base or a panel, or down and spectating)
+static int in_game(void)              // a world is up (flying, in a building or a panel, or down)
 {
-    return G_APP && *(int *)(G_APP + APP_MODE) != 0 && !*(int *)(G_APP + 0x44) && !lobby_waiting();
+    return G_APP && *(int *)(G_APP + APP_MODE) != 0 && !*(int *)(G_APP + APP_QUIT) && !lobby_waiting();
 }
 
-static void end_for_all(int n)
+static void end_here(int n)
 {
-    net_send(NET_ALL, MSG_GAME_END, &n, sizeof n, 1);
-    mlog("ending: the game ends (_PROCESS(%d)) - for everyone", n);
-    o_process(n);
+    if (G_APP && *(uint8_t **)(G_APP + APP_BUILDING)) o_process(n);   // in a building: as its script does
+    else g_pending = n;
+}
+
+static void end_game(int n)
+{
+    if (net_mode() == NET_CLIENT) {               // the host ends it for everyone, us included
+        net_send(0, MSG_GAME_END, &n, sizeof n, 1);
+        mlog("ending: the game ends here (_PROCESS(%d)) - asking the host to end it for everyone", n);
+        return;
+    }
+    if (net_mode() == NET_HOST) {
+        net_send(NET_ALL, MSG_GAME_END, &n, sizeof n, 1);
+        mlog("ending: the game ends (_PROCESS(%d)) - for everyone", n);
+    }
+    end_here(n);
 }
 
 static char __stdcall h_process(int n)
 {
     if (n != 4 && n != 5) return o_process(n);
-    if (net_mode() == NET_HOST) { end_for_all(n); return 1; }
-    if (net_mode() == NET_CLIENT) {               // the host ends it for everyone, us included
-        net_send(0, MSG_GAME_END, &n, sizeof n, 1);
-        mlog("ending: our script ends the game (_PROCESS(%d)) - asking the host to end it for everyone", n);
-        return 1;
-    }
-    return o_process(n);
+    end_game(n);
+    return 1;
+}
+
+// ProcessInput (respawn.c), every frame in flight and while down
+void ending_frame(void)
+{
+    if (!g_pending || !G_APP) return;
+    int n = g_pending;
+    g_pending = 0;
+    *(int *)A_GAME_STATE = n == 4 ? 7 : 6;
+    mlog("ending: the end of the game (_PROCESS(%d)) - the credits", n);
+    CALL(A_THE_END, the_end_fn)(G_APP, n == 4 ? 2 : 1);
+    *(int *)(G_APP + APP_QUIT) = 1;               // then the main menu, as after the game's own ending
 }
 
 int ending_handle(int type, int from, const uint8_t *data, int len)
 {
     if (type != MSG_GAME_END) return 0;
     int n = len == sizeof(int) ? *(const int *)data : 0;
-    if ((n != 4 && n != 5) || !in_game()) return 1;
+    if ((n != 4 && n != 5) || !in_game() || g_pending) return 1;
     if (net_mode() == NET_HOST) {
         mlog("ending: player %d finished the game", from);
-        end_for_all(n);
+        end_game(n);
     } else if (net_mode() == NET_CLIENT && from == 0) {
         mlog("ending: the host finished the game (_PROCESS(%d))", n);
-        o_process(n);
+        end_here(n);
     }
     return 1;
 }
 
-// harness: "gameend <4|5>" - as if a script ended the game
+// harness: "gameend <4|5>" - as if a building's script ended the game
 void ending_test(int n)
 {
-    if (o_process) h_process(n == 4 ? 4 : 5);
+    if (o_process && in_game()) end_game(n == 4 ? 4 : 5);
 }
 
 void ending_install(void)
