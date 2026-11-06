@@ -15,6 +15,7 @@ uint8_t *coop_spawn_player(const uint8_t *blob, int len, const float m[16], cons
 void coop_drive(uint8_t *g, const float m[16], const float vel[3]);
 void coop_remove_glider(uint8_t *g);
 int coop_in_flight(void);
+int coop_in_base(void);              // the base screen is open
 extern int g_base_world;             // the host's world is running a tick while the host is in a base (#37)
 int coop_base_world_running(void);   // the host is in a base (or a panel) and its world keeps running there
 void aim1_coop_install(void);
@@ -50,6 +51,12 @@ void respawn_test(const char *cmd);
 // killcredit.c: a guest's kills count for the guest
 void killcredit_install(void);
 int killcredit_handle(int type, int from, const uint8_t *data, int len);
+
+// ending.c: the end of the game reaches every player
+void ending_install(void);
+int ending_handle(int type, int from, const uint8_t *data, int len);
+void ending_frame(void);
+void ending_test(int n);
 
 // mapmark.c: the other players as pointers on the map screen
 void mapmark_install(void);
