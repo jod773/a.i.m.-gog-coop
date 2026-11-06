@@ -109,7 +109,14 @@ def revive(dead, since):
         print('  %s is down and %s found no mechmind' % (dead, other))
         return False
     # into a base at once: the mechmind lies where its owner was shot down, among those NPCs
-    h.send(S.G[other], ['pickmind', 'sleep 500', 'enter ' + base, 'sleep 5000'], timeout=60)
+    t = log_len(S.G[other])
+    h.send(S.G[other], ['pickmind', 'sleep 500'], timeout=60)
+    # one lying in a base's gate takes us straight in: an "enter" now would wait for the next flight
+    # frame (game commands run in flight only) and take us back in right after the fly-out
+    since_pick = log_text(other)[t:]
+    if 'in a base' not in since_pick and 'delivered to' not in since_pick:
+        h.send(S.G[other], ['enter ' + base], timeout=60)
+    h.send(S.G[other], ['sleep 5000'], timeout=60)
     if dead == 'host':
         ok = wait_log(S.G['host'], 'back in our own world', since['host'], 20)
         h.send(S.G['host'], ['sleep 2000', 'click %d %d' % FLY_OUT, 'sleep 4000'], timeout=60)
