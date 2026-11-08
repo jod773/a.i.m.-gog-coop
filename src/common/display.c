@@ -220,10 +220,27 @@ static HRESULT WINAPI h_Reset(void *dev, PP8 *pp)
 // window: only exclusive fullscreen gets them.
 typedef void (WINAPI *SetGammaRamp_t)(void *, DWORD, const void *);
 static SetGammaRamp_t o_SetGammaRamp;
+// How bright the last ramp the game asked for is, in percent of a straight one (100), even when it isn't
+// passed on: a test copy has to see that the game went dark.
+static int g_last_ramp = 100;
+int display_last_ramp(void) { return g_last_ramp; }
+
+static void note_ramp(const void *ramp)
+{
+    if (!ramp) return;
+    g_last_ramp = (int)(((const uint16_t *)ramp)[128] * 100u / (128u * 257u));
+    static int n;
+    if (g_test && n++ < 40) {
+        const uint16_t *r = (const uint16_t *)ramp;
+        mlog("display: gamma ramp %u %u %u %u", r[1], r[64], r[128], r[255]);
+    }
+}
+
 static void WINAPI h_SetGammaRamp(void *dev, DWORD flags, const void *ramp)
 {
     static int n;
     if (!n++) mlog("display: the game sets gamma ramps (Direct3D)");
+    note_ramp(ramp);
     if (g_mode == DISPLAY_FULLSCREEN && !g_test) o_SetGammaRamp(dev, flags, ramp);
 }
 
@@ -232,6 +249,7 @@ static BOOL WINAPI h_SetDeviceGammaRamp(HDC dc, void *ramp)
 {
     static int n;
     if (!n++) mlog("display: the game sets gamma ramps (GDI)");
+    note_ramp(ramp);
     if (g_mode == DISPLAY_FULLSCREEN && !g_test) return o_SetDeviceGammaRamp(dc, ramp);
     return TRUE;
 }

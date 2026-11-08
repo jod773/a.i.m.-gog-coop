@@ -15,6 +15,7 @@ HWND display_window(void);
 // called when the game window becomes active again
 void display_on_activate(void (*cb)(void));
 void *display_device(void);            // the game's IDirect3DDevice8 (NULL before CreateDevice)
+int display_last_ramp(void);           // brightness of the last gamma ramp the game asked for, 100 = straight
 // [Video] Antialiasing (0/2/4/8), VSync (fullscreen; -1 = the game's), Anisotropy (forced level, 0 = off)
 int display_msaa(void);
 void display_set_msaa(int n);          // applied by the next device Reset

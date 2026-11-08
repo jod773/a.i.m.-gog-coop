@@ -11,7 +11,8 @@
 // message types of the core (game modules use their own from 23 up)
 enum { MSG_HELLO = 16, MSG_MECH = 17, MSG_STATE = 18, MSG_WORLD_BEGIN = 19, MSG_WORLD_FILE = 20,
        MSG_WORLD_END = 21, MSG_WORLD_REQ = 22, MSG_SAY = 45,
-       MSG_PROFILE_UP = 53, MSG_PROFILE_BACK = 54 /* a joining player's profile file: backup on the host (#42) */ };
+       MSG_PROFILE_UP = 53, MSG_PROFILE_BACK = 54 /* a joining player's profile file: backup on the host (#42) */,
+       MSG_CAMPAIGN = 58 /* the game being played: its id keys the guests' profiles (#85) */ };
 
 typedef struct { DWORD t; float m[16]; float vel[3]; } snapshot;   // received glider state
 
@@ -79,6 +80,9 @@ void cg_session_started(void);
 void cg_reset(void);
 void cg_peer_joined(int peer);                        // host: the world went out to this player
 int cg_command(const char *cmd, const char *arg, const char *line);   // harness, 1 = handled
+// host: the id of the game being played ("" = none, a save from an older version), asked as the world goes out;
+// NULL = the game doesn't know campaigns (Clan Wars): profiles are per host and player
+const char *cg_campaign_id(void);
 // extra data kept in the player's profile (the A.I.M. 2 quest log)
 uint8_t *cg_profile_extra(int *len);
 void cg_profile_extra_restore(const uint8_t *data, int len);

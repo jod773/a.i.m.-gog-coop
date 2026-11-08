@@ -22,8 +22,10 @@
 #define SM_STATS       0xeb0
 #define SM_STATS_LEN   0xd4           // as the game saves it
 
-// "ST2\0" | i32 rating | f32 experience | 0xd4 bytes statistics
-#define EXTRA_LEN (4 + 4 + 4 + SM_STATS_LEN)
+// "ST2\0" | i32 rating | f32 experience | 0xd4 bytes statistics | u32 own first-visit flags (questlog.c)
+// (older profiles end after the statistics: first visit done, they have played)
+#define EXTRA_OLD (4 + 4 + 4 + SM_STATS_LEN)
+#define EXTRA_LEN (EXTRA_OLD + 4)
 
 uint8_t *cg_profile_extra(int *len)
 {
@@ -35,6 +37,8 @@ uint8_t *cg_profile_extra(int *len)
     memcpy(b + 4, rec + REC_RATING, 4);
     memcpy(b + 8, rec + REC_EXPERIENCE, 4);
     memcpy(b + 12, sm + SM_STATS, SM_STATS_LEN);
+    uint32_t own = questlog_own_bits();
+    memcpy(b + EXTRA_OLD, &own, 4);
     *len = EXTRA_LEN;
     return b;
 }
@@ -43,10 +47,13 @@ uint8_t *cg_profile_extra(int *len)
 int stats_put_back(const uint8_t *data, int len)
 {
     uint8_t *rec = G_PLAYER_REC, *sm = G_SM;
-    if (!rec || !sm || len != EXTRA_LEN || memcmp(data, "ST2", 4)) return 0;
+    if (!rec || !sm || (len != EXTRA_LEN && len != EXTRA_OLD) || memcmp(data, "ST2", 4)) return 0;
     memcpy(rec + REC_RATING, data + 4, 4);
     memcpy(rec + REC_EXPERIENCE, data + 8, 4);
     memcpy(sm + SM_STATS, data + 12, SM_STATS_LEN);
+    uint32_t own = 0xffffffffu;
+    if (len == EXTRA_LEN) memcpy(&own, data + EXTRA_OLD, 4);
+    questlog_set_own_bits(own);
     return 1;
 }
 

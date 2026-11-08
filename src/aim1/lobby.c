@@ -217,6 +217,7 @@ static char THISCALL mp_button(uint8_t *smenu)
         }
         if (!strcmp(act, "hostnew")) {
             coop_set_host_intent(1);
+            questlog_new_campaign(1);
             g_user_cmd = 0;
             CALL(A_START_MENU_CMD, pcmd_fn)(smenu, 3);      // difficulty choice, then the game starts
             g_user_cmd = 1;
@@ -224,6 +225,7 @@ static char THISCALL mp_button(uint8_t *smenu)
         }
         if (!strcmp(act, "hostload")) {
             coop_set_host_intent(1);
+            questlog_new_campaign(0);
             g_user_cmd = 0;
             CALL(A_START_MENU_CMD, pcmd_fn)(smenu, 9);      // the load dialog
             g_user_cmd = 1;

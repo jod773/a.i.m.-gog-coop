@@ -247,6 +247,7 @@ void cg_frame(void) { mirror_frame(); questlog_frame(); notify_frame(); }
 void cg_session_started(void) { notify_session_started(); }
 void cg_reset(void) { mirror_reset(); questlog_reset(); }
 void cg_peer_joined(int peer) { mirror_peer_joined(peer); questlog_peer_joined(peer); }
+const char *cg_campaign_id(void) { return NULL; }
 uint8_t *cg_profile_extra(int *len) { return questlog_blob(len); }
 
 void cg_profile_extra_restore(const uint8_t *data, int len)

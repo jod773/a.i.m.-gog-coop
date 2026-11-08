@@ -20,6 +20,7 @@
 // the main menu) runs only once nobody is left up.
 #include "coop.h"
 #include "../common/net.h"
+#include "../common/display.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -335,7 +336,7 @@ void respawn_base_entered(void)
 #define OBJ_MOVE_ON       0x5a                       // CObjectList::PreMove / Move move it
 #define A_CAM_COCKPIT     0x0041b000                 // thiscall(camera, glider): cockpit view, camera mode 0
 #define A_REMOVE_FLAG     0x0043a660                 // thiscall(script manager, name): REMOVEEVENT
-#define A_FADE_BACK       0x00497c00                 // the picture back from the death fade
+#define A_PICTURE_NOW     0x00497ca0                 // no fade, the normal gamma ramp at once
 
 static int revive_host(const char *where)
 {
@@ -354,7 +355,7 @@ static int revive_host(const char *where)
     *(float *)(app + APP_DEATH_TIMER) = 0.0f;
     DEATH_CAM_TARGET = NULL;
     CALL(A_CAM_COCKPIT, cam_fn)(cam, g);
-    CALL(A_FADE_BACK, v_fn)();
+    CALL(A_PICTURE_NOW, v_fn)();
     uint8_t *sm = *(uint8_t **)A_TEXT_DB_PTR;
     char killed[48];
     snprintf(killed, sizeof killed, "%.31s.KILLED", (const char *)mo);
@@ -467,22 +468,41 @@ void respawn_reset(void)
 #define CAM_POS         0x190                 // as the death branch writes it
 #define A_CAM_LOOK_AT   0x0041b2e0            // thiscall(camera, object)
 
+#define APP_DYING       0x144                 // the death branch has started
+#define A_FADE_MODE     0x005b7aa0            // renderer thread: 0 none, 1 fading out to black, 2 fading in
+#define A_FADE_THREAD   0x0054114c            // the renderer thread does the fading
+#define A_GAMMA_OK      0x0054114b            // the device takes gamma ramps
+
 static float g_cam_yaw, g_cam_pitch = 0.35f, g_cam_dist = 60.0f;
 int g_spect_cam = 1;                          // test: "spectcam 0" leaves the game's camera alone
+
+// harness "fadestat": is the picture dark? (test copies ignore gamma ramps and shots show the back buffer)
+void respawn_fade_test(void)
+{
+    mlog("fadestat: spectating %d, dying %d, fade mode %d, thread fade %d, gamma %d, last ramp %d%%",
+         g_spectating, G_APP ? G_APP[APP_DYING] : -1, *(int *)A_FADE_MODE, *(uint8_t *)A_FADE_THREAD,
+         *(uint8_t *)A_GAMMA_OK, display_last_ramp());
+}
 
 static void spectator_camera(void)
 {
     uint8_t *cam = G_CAMERA, *t = DEATH_CAM_TARGET;
+    // The death branch only flashes the picture: dark ramp (0x497cd0), fade in (0x497df0, fade mode 2). Near
+    // the end of its sequence, and with nothing to follow, it fades out to black (0x497c00, fade mode 1). This
+    // used to call 0x497c00, taken for "the picture back", so a spectator's screen went black (#84; only in
+    // fullscreen: windowed games ignore gamma ramps). Nothing may fade a spectator's picture out.
+    if (*(int *)A_FADE_MODE == 1) {
+        typedef void (__cdecl *v_fn)(void);
+        CALL(A_PICTURE_NOW, v_fn)();
+        static int nlog;
+        if (nlog++ < 5) mlog("respawn: a fade to black stopped while spectating");
+    }
     if (!g_spect_cam || !cam || !t || t == G_PLAYER_GLIDER) return;
     if (*(uint8_t **)(cam + CAM_TARGET) != t) {
         typedef void (THISCALL *look_fn)(uint8_t *, uint8_t *);
         CALL(A_CAM_LOOK_AT, look_fn)(cam, t);
         const float *m = (const float *)(t + OBJ_MATRIX);
         g_cam_yaw = atan2f(-m[6], -m[2]);                    // start behind them (third axis = forward)
-        // the death branch darkened the screen (0x497cd0 / 0x497df0: a darker gamma ramp, or with the
-        // gamma faded by the renderer thread, fade mode 2); 0x497c00 brings the picture back (fade mode 1)
-        typedef void (__cdecl *v_fn)(void);
-        CALL(0x00497c00, v_fn)();
         mlog("respawn: camera on %s", coop_remote_name(t) ? coop_remote_name(t) : "?");
     }
     // The dead player's game doesn't use the mouse: we read it ourselves (the gamepad's right stick
@@ -598,8 +618,8 @@ static void THISCALL h_process_input(uint8_t *app)
 
 int respawn_spectating(void) { return g_spectating; }
 
-// harness: "mindstat" - the mechminds lying around; "pickmind" - put our glider on the nearest one
-void respawn_test(const char *cmd)
+// harness: "mindstat" - the mechminds lying around; "pickmind [pilot]" - put our glider on the nearest one (or that pilot's)
+void respawn_test(const char *cmd, const char *pilot)
 {
     uint8_t *best = NULL;
     float bd = 1e30f;
@@ -608,8 +628,10 @@ void respawn_test(const char *cmd)
         if (!o || !o[OBJ_ALIVE] || *(int *)(o + OBJ_TYPE) != TYPE_THING) continue;
         float *p = (float *)(o + OBJ_POS);
         float d = G_PLAYER_GLIDER ? dist2(p, (float *)(G_PLAYER_GLIDER + OBJ_POS)) : 0;
-        mlog("mindstat: thing %p kind %x at %.0f %.0f %.0f (%.0f away)", o, *(int *)(o + THING_KIND), p[0], p[1], p[2],
+        const char *nm = *(int *)(o + 0x40c) > 0 ? (const char *)o + 0x27c + 4 : "";
+        mlog("mindstat: thing %p kind %x '%.31s' at %.0f %.0f %.0f (%.0f away)", o, *(int *)(o + THING_KIND), nm, p[0], p[1], p[2],
              d > 0 ? (double)sqrtf(d) : 0.0);
+        if (pilot && pilot[0] && lstrcmpiA(nm, pilot)) continue;
         int own = 0;                               // a fallen teammate's own mechmind first
         for (int i = 0; i < NET_MAX_PEERS; i++) own |= g_fallen[i].used && g_fallen[i].thing == o;
         if (*(int *)(o + THING_KIND) == KIND_MECHMIND && (own || d < bd)) { bd = own ? -1.0f : d; best = o; }

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 #define VT_BUILDING   0x0052d6e8   // CBuildingObject
 // CBuildingObject::Run, when the player flies in: flag, building, its two names, state
@@ -150,6 +151,32 @@ int aim1_debug_cmd(const char *cmd, const char *arg)
                 memcpy(&fv, objs[k].p + i, 4);
                 if (iv == (int32_t)v || fv == (float)v) mlog("findval: %s+0x%x = %d / %g", objs[k].what, i, iv, fv);
             }
+        return 1;
+    }
+    if (!strcmp(cmd, "group") || !strcmp(cmd, "togroup")) {   // a group by name (_SHOWOBJECT targets): where, shown
+        // CMechGroupList 0x678f50: +4 count, +8 groups; group +0x4c name, +0x60f4 members, +0x623c hidden,
+        // +0x623e shown, +0x6254 position. The view range is (int)*0x5b7418 * 10 (CMechGroup::Run 0x505a30).
+        char name[33] = "", rest[32] = "";
+        sscanf(arg, "%32s %31s", name, rest);
+        int n = *(int *)(0x00678f50 + 4);
+        uint8_t **gs = *(uint8_t ***)(0x00678f50 + 8);
+        float view = (float)*(int *)0x005b7418 * 10.0f;   // VisibleRadius (int)
+        for (int i = 1; i < n && gs; i++) {
+            uint8_t *gr = gs[i];
+            if (!gr || _stricmp((char *)gr + 0x4c, name)) continue;
+            const float *p = (const float *)(gr + 0x6254);
+            const float *q = g ? (const float *)(g + OBJ_POS) : p;
+            float d = sqrtf((p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]));
+            mlog("group: %s #%d at %.0f %.0f %.0f, %d members, hidden %d, %d, shown %d, %.0f away, view range %.0f",
+                 name, i, p[0], p[1], p[2], *(int *)(gr + 0x60f4), gr[0x623c], gr[0x623d], gr[0x623e], d, view);
+            if (!strcmp(cmd, "togroup") && g) {           // halfway into the view range: the group makes its gliders
+                float dist = rest[0] ? (float)atof(rest) : view * 0.5f;
+                move_player(p[0] + dist * 0.7071f, p[1] + dist * 0.7071f, p[2] + 150.0f);
+                mlog("group: moved %.0f from %s", dist, name);
+            }
+            return 1;
+        }
+        mlog("group: no group %s (%d groups)", name, n);
         return 1;
     }
     if (!strcmp(cmd, "unlock")) { unlock_passages(); return 1; }
