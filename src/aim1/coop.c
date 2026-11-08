@@ -219,7 +219,7 @@ int cg_chat_allowed(void) { return coop_in_flight() || respawn_spectating(); }
 int cg_pilot_saveable(void)                    // not while dying
 {
     uint8_t *mo = G_PLAYER_MECHANOID;
-    return !mo[0x74] && !mo[0xac] && !mo[0x154] && !G_PLAYER_GLIDER[0x10d0];
+    return !mo[0x74] && !mo[0xac] && !mo[0x154] && (!G_PLAYER_GLIDER[0x10d0] || *(int *)0x005b7ab4);   // +0x10d0 in stasis too
 }
 
 uint8_t *cg_pilot_save(int *len) { return coop_mechanoid_save(G_PLAYER_MECHANOID, len); }
@@ -591,6 +591,14 @@ int cg_command(const char *cmd, const char *arg, const char *line)
     } else if (!strcmp(cmd, "npcai") && in_flight()) {
         void mirror_test_ai(void);
         mirror_test_ai();
+    } else if (!strcmp(cmd, "stasis") && in_flight()) {           // "stasis [in|out]"
+        void mirror_test_stasis(const char *);
+        mirror_test_stasis(arg);
+    } else if (!strcmp(cmd, "breakpiece") && in_flight()) {       // "breakpiece <piece> [pilot]"
+        void mirror_test_break(int, const char *);
+        char pilot[32] = "";
+        sscanf(line, "%*s %*s %31s", pilot);
+        mirror_test_break(atoi(arg), pilot);
     } else if (!strcmp(cmd, "puppethit") && in_flight()) {        // "puppethit <damage> [pilot]"
         void mirror_test_hit(float);
         extern char g_test_pilot[32];

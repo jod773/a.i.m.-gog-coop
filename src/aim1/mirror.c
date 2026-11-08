@@ -22,13 +22,37 @@
 
 enum { MSG_NPC_SPAWN = 32, MSG_NPC_GONE = 33, MSG_NPC_STATES = 34, MSG_NPC_ROSTER_END = 35,
        MSG_FIRE = 36, MSG_NPC_BOOM = 37, MSG_WORLD_TIME = 38, MSG_PLAYER_DOWN = 39, MSG_NPC_HEALTH = 42,
-       MSG_PLAYER_HEALTH = 47 /* char name[32], float v[5] */ };
+       MSG_PLAYER_HEALTH = 47 /* char name[32], float v[5] (+ u32 broken pieces since v2026.11.09) */,
+       MSG_NPC_BROKEN = 61 /* u16 n, n x (u16 id, u32 broken pieces) */ };
 
 #pragma pack(push, 1)
 typedef struct { uint16_t id; char name[32]; uint8_t grp[GROUP_HDR_LEN]; } spawn_hdr;
 typedef struct { uint16_t id; float pos[3]; float r[9]; float vel[3]; } npc_state;
 typedef struct { uint16_t id; float v[5]; } npc_health;
+typedef struct { uint16_t id; uint32_t broken; } npc_broken;
 #pragma pack(pop)
+
+// The model's broken pieces (a wing shot off): CGliderObject::Damage adds the damage that reached the
+// parts to each model piece facing the hit, and a piece past 5 % of the model's limit breaks off -
+// 0x4f3840 thiscall(glider, piece) flips bit `piece` of +0xb9c (8 pieces at most, the model's count at
+// model +0x210, model = glider +0xc) and throws the debris; a piece holding FIRE / FIRE1 also sets the
+// burning flags +0xba0. That runs only in the world the hit landed in, so the others' copy of a
+// glider never lost a wing: the owner's mask travels with the health and the copy breaks the same
+// pieces with the same function (the debris flies there too).
+#define GLIDER_BROKEN 0xb9c
+#define A_BREAK_PIECE 0x004f3840
+typedef void (THISCALL *break_fn)(uint8_t *, int);
+
+// Stasis (the STASIS key, the generator from the starting building): ProcessInput 0x4203a0 counts 10 s
+// (state 1), then parks the player glider - velocity 0, position held, glider +0x10d0 = 1 - (state 2)
+// until the key again (state 3, 10 s back); Render 0x423510 multiplies the frame time 0x578088 by up to
+// 5 for it just before ProcessInput: the game's "wait". In co-op +0x10d0 looked like a death (the others
+// blew our glider up and dropped our mechmind), and the world and its clock are the host's. Now the
+// state goes out with the health; the fast-forward runs only on the host and only while every
+// teammate who is up is in stasis too - otherwise the factor is taken back out at ProcessInput.
+#define A_STASIS_STATE 0x005b7ab4      // int: 0 off, 1 going in, 2 in stasis, 3 coming out
+#define A_STASIS_TIMER 0x005b7ac4      // float: seconds left of the 10
+#define A_FRAME_TIME   0x00578088      // float
 
 // A pilot's health (#22): shield +0x15c, armour +0x160 (both used up first by
 // CMechanoid's damage 0x4ad8a0), then the damage (+0x24) of its three parts - reactor +0x48,
@@ -46,6 +70,8 @@ typedef struct {
     int present, boomed;
     float hp[5];          // health as last sent
     int hp_sent;
+    uint32_t broken;      // model pieces broken off (host: as last sent; client: as received)
+    int broken_sent;
     // client
     uint8_t *blob;
     int blob_len;
@@ -57,7 +83,8 @@ typedef struct {
 } npc;
 
 static npc g_npc[MAXNPC];
-typedef struct { char name[32]; float v[5]; int valid; } player_hp;   // the other players' health
+typedef struct { char name[32]; float v[5]; int valid; uint32_t broken; int has_broken; uint8_t *glider;
+                 int stasis; DWORD got; } player_hp;   // the other players' health (and stasis)
 static player_hp g_php[NET_MAX_PEERS];
 static int g_roster_done;
 static DWORD g_last_scan, g_last_cleanup;
@@ -187,6 +214,29 @@ static void send_health(void)
     if (n) {
         *(uint16_t *)pkt = (uint16_t)n;
         net_send(NET_ALL, MSG_NPC_HEALTH, pkt, 2 + n * sizeof(npc_health), 1);
+    }
+    // broken model pieces, when they change (a new copy gets them once)
+    uint8_t bpkt[2 + 64 * sizeof(npc_broken)];
+    n = 0;
+    for (int i = 0; i < MAXNPC; i++) {
+        npc *e = &g_npc[i];
+        if (!e->used || !e->present || !e->glider || e->boomed) continue;
+        uint32_t b = *(uint32_t *)(e->glider + GLIDER_BROKEN);
+        if (e->broken_sent && b == e->broken) continue;
+        e->broken = b;
+        e->broken_sent = 1;
+        npc_broken *r = (npc_broken *)(bpkt + 2) + n;
+        r->id = (uint16_t)i;
+        r->broken = b;
+        if (++n == 64) {
+            *(uint16_t *)bpkt = (uint16_t)n;
+            net_send(NET_ALL, MSG_NPC_BROKEN, bpkt, 2 + n * sizeof(npc_broken), 1);
+            n = 0;
+        }
+    }
+    if (n) {
+        *(uint16_t *)bpkt = (uint16_t)n;
+        net_send(NET_ALL, MSG_NPC_BROKEN, bpkt, 2 + n * sizeof(npc_broken), 1);
     }
 }
 
@@ -361,7 +411,7 @@ static void host_scan(void)
             e->used = 1;
             lstrcpynA(e->name, name, 32);
         }
-        if (fresh) e->boomed = 0, e->hp_sent = 0;    // a new spawn is repaired: its health again
+        if (fresh) e->boomed = 0, e->hp_sent = 0, e->broken_sent = 0;    // a new spawn is repaired: its health again
         e->glider = o;
         e->gen = gen;
         e->present = 1;
@@ -430,6 +480,7 @@ void mirror_peer_joined(int peer)
         if (g_npc[i].used && g_npc[i].glider && g_npc[i].gen == coop_world_gen() && alive_object(g_npc[i].glider)) {
             send_spawn(peer, i);
             g_npc[i].hp_sent = 0;              // the new player's copies start repaired
+            g_npc[i].broken_sent = 0;
         }
     net_send(peer, MSG_NPC_ROSTER_END, NULL, 0, 1);
 }
@@ -472,6 +523,24 @@ static void apply_health(uint8_t *g, const float *v)
     for (int k = 2; k < 5; k++) if (v[k] > 0) mo[k_health_off[k] - 0x24 + 0x2d] = 1;   // part "damaged"
 }
 
+// the owner's broken pieces on our copy: the missing ones break off here too (with their debris)
+static void apply_broken(uint8_t *g, uint32_t want)
+{
+    const uint8_t *model = *(uint8_t **)(g + 0xc);
+    int n = model ? *(const int *)(model + 0x210) : 0;
+    if (n > 8) n = 8;
+    for (int i = 0; i < n; i++) {
+        uint32_t b = 1u << i, have = *(uint32_t *)(g + GLIDER_BROKEN);
+        if ((want & b) && !(have & b)) {
+            CALL(A_BREAK_PIECE, break_fn)(g, i);
+            static int nlog;
+            if (nlog++ < 20) mlog("mirror: %s lost piece %d here too", glider_pilot(g) ? glider_pilot(g) : "a player", i);
+        } else if (!(want & b) && (have & b)) {
+            *(uint32_t *)(g + GLIDER_BROKEN) &= ~b;        // repaired on their side
+        }
+    }
+}
+
 static void client_frame(void)
 {
     int gen = coop_world_gen();
@@ -512,6 +581,7 @@ static void client_frame(void)
         if (e->glider && !e->glider[GLIDER_DYING]) {
             coop_drive(e->glider, m, vel);
             if (e->hp_sent) apply_health(e->glider, e->hp);   // the host's values, every frame (shields regenerate)
+            if (e->broken_sent) apply_broken(e->glider, e->broken);
         }
     }
 }
@@ -920,10 +990,10 @@ void mirror_test_stat(void)
         const float *s = e->nsnap ? e->snap[0].m + 12 : NULL;
         const float *p = g ? (const float *)(g + OBJ_POS) : NULL;
         float d = s && p ? sqrtf((s[0] - p[0]) * (s[0] - p[0]) + (s[1] - p[1]) * (s[1] - p[1]) + (s[2] - p[2]) * (s[2] - p[2])) : -1;
-        mlog("mirrorstat: %3d %-14.32s %p %s%s age %5ld off %7.1f at %7.0f %7.0f%s%s", i, e->name, g,
+        mlog("mirrorstat: %3d %-14.32s %p %s%s age %5ld off %7.1f at %7.0f %7.0f%s%s broken %02x", i, e->name, g,
              e->spawned ? "puppet" : "local ", g && g[GLIDER_DYING] ? " dying" : "",
              e->nsnap ? (long)(now - e->snap[0].t) : -1L, d, s ? s[0] : 0, s ? s[1] : 0,
-             e->boomed ? " boomed" : "", e->present ? " present" : "");
+             e->boomed ? " boomed" : "", e->present ? " present" : "", g ? *(uint32_t *)(g + GLIDER_BROKEN) : 0);
     }
     mlog("mirrorstat: %d entries", n);
 }
@@ -937,14 +1007,39 @@ void mirror_test_player(int hit, float dmg)
     }
     uint8_t *g;
     const char *nm;
+    // what the target bar draws (0x441390): armour 0x4acd20(0) = +0x160 / (*(+0x124))+0x30, shield 0x4accc0(0) =
+    // +0x15c / (*(+0xec))+0x30
+    typedef float (THISCALL *frac_fn)(void *, int);
     for (int i = 0; (g = coop_remote_by_index(i, &nm)) != NULL; i++) {
         uint8_t *mo = glider_mechanoid(g);
-        if (mo) mlog("playerhp: %s %8.1f %8.1f %7.1f %7.1f %7.1f", nm, *(float *)(mo + k_health_off[0]), *(float *)(mo + k_health_off[1]),
-                     *(float *)(mo + k_health_off[2]), *(float *)(mo + k_health_off[3]), *(float *)(mo + k_health_off[4]));
+        if (mo) mlog("playerhp: %s %8.1f %8.1f %7.1f %7.1f %7.1f | bar: armour %.2f shield %.2f | broken %02x",
+                     nm, *(float *)(mo + k_health_off[0]), *(float *)(mo + k_health_off[1]),
+                     *(float *)(mo + k_health_off[2]), *(float *)(mo + k_health_off[3]), *(float *)(mo + k_health_off[4]),
+                     CALL(0x004acd20, frac_fn)(mo, 0), CALL(0x004accc0, frac_fn)(mo, 0), *(uint32_t *)(g + GLIDER_BROKEN));
     }
     uint8_t *mo = glider_mechanoid(G_PLAYER_GLIDER);
-    if (mo) mlog("playerhp: (us) %8.1f %8.1f %7.1f %7.1f %7.1f", *(float *)(mo + k_health_off[0]), *(float *)(mo + k_health_off[1]),
-                 *(float *)(mo + k_health_off[2]), *(float *)(mo + k_health_off[3]), *(float *)(mo + k_health_off[4]));
+    if (mo) mlog("playerhp: (us) %8.1f %8.1f %7.1f %7.1f %7.1f | broken %02x", *(float *)(mo + k_health_off[0]), *(float *)(mo + k_health_off[1]),
+                 *(float *)(mo + k_health_off[2]), *(float *)(mo + k_health_off[3]), *(float *)(mo + k_health_off[4]),
+                 *(uint32_t *)(G_PLAYER_GLIDER + GLIDER_BROKEN));
+}
+
+// test: "breakpiece <piece> [pilot]" - a model piece of our glider (or of that NPC) breaks off, as a hit does
+void mirror_test_break(int piece, const char *pilot)
+{
+    uint8_t *g = G_PLAYER_GLIDER;
+    if (pilot && pilot[0]) {
+        g = NULL;
+        FOR_EACH_OBJECT(o)
+            if (o[OBJ_ALIVE] && *(int *)(o + OBJ_TYPE) == TYPE_GLIDER && glider_pilot(o) && !strcmp(glider_pilot(o), pilot)) g = o;
+    }
+    const uint8_t *model = g ? *(uint8_t **)(g + 0xc) : NULL;
+    int n = model ? *(const int *)(model + 0x210) : 0;
+    if (!g || piece < 0 || piece >= n || piece > 7 || (*(uint32_t *)(g + GLIDER_BROKEN) & (1u << piece))) {
+        mlog("breakpiece: no (glider %p, %d pieces, broken %02x)", g, n, g ? *(uint32_t *)(g + GLIDER_BROKEN) : 0);
+        return;
+    }
+    CALL(A_BREAK_PIECE, break_fn)(g, piece);
+    mlog("breakpiece: %s piece %d of %d, broken %02x", g == G_PLAYER_GLIDER ? "our" : pilot, piece, n, *(uint32_t *)(g + GLIDER_BROKEN));
 }
 
 // test: "puppethit <damage> [pilot]" - a co-op player's puppet hits the nearest NPC (or that pilot), as a replayed
@@ -1081,28 +1176,35 @@ static void send_player_health(void)
 {
     static DWORD last, last_full;
     static float sent[5];
+    static uint32_t sent_broken;
+    static int32_t sent_stasis;
     DWORD now = GetTickCount();
     if (now - last < 250) return;
     last = now;
     uint8_t *mo = G_PLAYER_GLIDER ? glider_mechanoid(G_PLAYER_GLIDER) : NULL;
     if (!mo) return;
-    struct { char name[32]; float v[5]; } m;
+    struct { char name[32]; float v[5]; uint32_t broken; int32_t stasis; } m;   // an older build sends name + v only
     memset(&m, 0, sizeof m);
     lstrcpynA(m.name, coop_my_name(), sizeof m.name);
-    int changed = now - last_full >= 2000;
+    m.broken = *(uint32_t *)(G_PLAYER_GLIDER + GLIDER_BROKEN);
+    m.stasis = *(int32_t *)A_STASIS_STATE;
+    int changed = now - last_full >= 2000 || m.broken != sent_broken || m.stasis != sent_stasis;
+    sent_stasis = m.stasis;
     for (int k = 0; k < 5; k++) {
         m.v[k] = *(float *)(mo + k_health_off[k]);
         if (fabsf(m.v[k] - sent[k]) > 0.5f) changed = 1;
     }
     if (!changed) return;
     memcpy(sent, m.v, sizeof sent);
+    sent_broken = m.broken;
     last_full = now;
     net_send(NET_ALL, MSG_PLAYER_HEALTH, &m, sizeof m, 0);
 }
 
 static void got_player_health(const uint8_t *data, int len)
 {
-    if (len != 32 + 5 * (int)sizeof(float) || data[31]) return;
+    int has_broken = len == 32 + 5 * (int)sizeof(float) + 8;      // + broken pieces, stasis state
+    if ((len != 32 + 5 * (int)sizeof(float) && !has_broken) || data[31]) return;
     int slot = -1;
     for (int i = 0; i < NET_MAX_PEERS && slot < 0; i++)
         if (g_php[i].valid && !strcmp(g_php[i].name, (const char *)data)) slot = i;
@@ -1111,6 +1213,20 @@ static void got_player_health(const uint8_t *data, int len)
     if (slot < 0) return;
     memcpy(g_php[slot].name, data, 32);
     memcpy(g_php[slot].v, data + 32, sizeof g_php[slot].v);
+    int was = g_php[slot].valid ? g_php[slot].stasis : 0, st = 0;
+    if (has_broken) {
+        memcpy(&g_php[slot].broken, data + 32 + sizeof g_php[slot].v, 4);
+        memcpy(&st, data + 32 + sizeof g_php[slot].v + 4, 4);
+    }
+    g_php[slot].has_broken = has_broken;
+    g_php[slot].stasis = st;
+    g_php[slot].got = GetTickCount();
+    if (st == 2 && was != 2) {
+        char msg[96];
+        snprintf(msg, sizeof msg, aim1_ui("stasis_mate"), (const char *)data);
+        coop_notify(msg);
+        mlog("mirror: %s is in stasis", (const char *)data);
+    }
     if (!g_php[slot].valid) mlog("mirror: health of player %s received", g_php[slot].name);
     g_php[slot].valid = 1;
 }
@@ -1120,7 +1236,13 @@ static void apply_player_health(void)
     for (int i = 0; i < NET_MAX_PEERS; i++) {
         if (!g_php[i].valid) continue;
         uint8_t *g = coop_remote_glider(g_php[i].name);
-        if (g && g[OBJ_ALIVE] && !g[GLIDER_DYING]) apply_health(g, g_php[i].v);
+        if (!g || !g[OBJ_ALIVE] || g[GLIDER_DYING]) continue;
+        apply_health(g, g_php[i].v);
+        if (g != g_php[i].glider) {            // a new puppet (out of a base, back from the dead): whole until
+            g_php[i].glider = g;               // their next message says otherwise (at most 2 s)
+            g_php[i].has_broken = 0;
+        }
+        if (g_php[i].has_broken) apply_broken(g, g_php[i].broken);
     }
 }
 
@@ -1129,7 +1251,8 @@ static void check_own_death(void)
 {
     static int down;
     uint8_t *mo = G_PLAYER_GLIDER ? glider_mechanoid(G_PLAYER_GLIDER) : NULL;
-    int dead = mo && (mo[0x74] || mo[0xac] || mo[0x154] || G_PLAYER_GLIDER[GLIDER_DYING]);
+    // +0x10d0 without the pilot's death bytes is stasis (the parked glider), not a death
+    int dead = mo && (mo[0x74] || mo[0xac] || mo[0x154] || (G_PLAYER_GLIDER[GLIDER_DYING] && !*(int *)A_STASIS_STATE));
     if (dead && !down) {
         char n[32] = {0};
         lstrcpynA(n, coop_my_name(), sizeof n);
@@ -1137,6 +1260,51 @@ static void check_own_death(void)
         mlog("mirror: we were destroyed - told the others");
     }
     down = dead;
+}
+
+static float g_stasis_speed = 1.0f;    // the world's speed this frame (test log)
+
+// every teammate who is up is in stasis (their latest state, at most 3 s old; a player in a base or a
+// menu sends none and holds it up)
+static int team_in_stasis(void)
+{
+    int n = 0;
+    DWORD now = GetTickCount();
+    for (int i = 0; i < NET_MAX_PEERS; i++)
+        if (g_php[i].valid && (g_php[i].stasis == 1 || g_php[i].stasis == 2) && now - g_php[i].got < 3000 &&
+            coop_player_up(g_php[i].name)) n++;    // one coming out (3) ends it for everyone
+    return n >= coop_teammates_up();
+}
+
+// from ProcessInput, before the game's own: the frame time Render just multiplied for stasis
+void mirror_stasis_frame(void)
+{
+    static int was, fast;
+    int st = *(int *)A_STASIS_STATE;
+    if (net_mode() == NET_OFF || !coop_in_flight()) { was = st; fast = 0; return; }
+    float t = *(float *)A_STASIS_TIMER, f = st == 1 ? (10.0f - t) * 0.4f + 1.0f : st == 2 ? 5.0f : st == 3 ? t * 0.4f + 1.0f : 1.0f;
+    int allowed = net_mode() == NET_HOST && st && team_in_stasis();
+    if (!allowed && f > 1.0f) *(float *)A_FRAME_TIME /= f;
+    g_stasis_speed = allowed ? f : 1.0f;
+    if (st == 1 && was == 0 && !allowed) coop_notify(aim1_ui("stasis_wait"));
+    if (allowed && st == 2 && !fast) { coop_notify(aim1_ui("stasis_all")); mlog("mirror: everyone is in stasis - time x5"); }
+    if (st == 2 && was != 2) mlog("mirror: we are in stasis%s", allowed ? "" : " - time as normal until everyone is");
+    fast = allowed && st == 2;
+    was = st;
+}
+
+// test: "stasis [in|out]" - what the STASIS key does in ProcessInput, then our state, the teammates'
+// and whether the time may run faster
+void mirror_test_stasis(const char *arg)
+{
+    int *st = (int *)A_STASIS_STATE;
+    if (!strcmp(arg, "in") && *st == 0) { *st = 1; *(float *)A_STASIS_TIMER = 10.0f; }
+    if (!strcmp(arg, "out") && *st == 2 && G_PLAYER_GLIDER) { G_PLAYER_GLIDER[GLIDER_DYING] = 0; *st = 3; *(float *)A_STASIS_TIMER = 10.0f; }
+    mlog("stasis: ours %d (%.1f s), glider +0x10d0 %d, world speed x%.1f, team in stasis %d, teammates up %d",
+         *(int *)A_STASIS_STATE, *(float *)A_STASIS_TIMER, G_PLAYER_GLIDER ? G_PLAYER_GLIDER[GLIDER_DYING] : -1,
+         g_stasis_speed, team_in_stasis(), coop_teammates_up());
+    for (int i = 0; i < NET_MAX_PEERS; i++)
+        if (g_php[i].valid) mlog("stasis: %s %d (%lu ms ago)", g_php[i].name, g_php[i].stasis, GetTickCount() - g_php[i].got);
 }
 
 int mirror_handle(int type, int from, const uint8_t *data, int len)
@@ -1173,6 +1341,18 @@ int mirror_handle(int type, int from, const uint8_t *data, int len)
         }
         static int nlog;
         if (nlog++ < 5) mlog("mirror: NPC health for %d gliders", n);
+        return 1;
+    }
+    case MSG_NPC_BROKEN: {                     // applied in client_frame, like the health
+        if (len < 2 || net_mode() != NET_CLIENT) return 1;
+        int n = *(const uint16_t *)data;
+        if (len < 2 + n * (int)sizeof(npc_broken)) return 1;
+        const npc_broken *r = (const npc_broken *)(data + 2);
+        for (int i = 0; i < n; i++, r++) {
+            if (r->id >= MAXNPC || !g_npc[r->id].used) continue;
+            g_npc[r->id].broken = r->broken;
+            g_npc[r->id].broken_sent = 1;
+        }
         return 1;
     }
     case MSG_NPC_SPAWN: {
@@ -1291,7 +1471,7 @@ void mirror_frame(void)
     if (GetTickCount() - dbg > 1000) {
         dbg = GetTickCount();
         uint8_t *mo = glider_mechanoid(G_PLAYER_GLIDER);
-        if (mo && (mo[0x74] || mo[0xac] || mo[0x154] || G_PLAYER_GLIDER[GLIDER_DYING]))
+        if (mo && (mo[0x74] || mo[0xac] || mo[0x154] || (G_PLAYER_GLIDER[GLIDER_DYING] && !*(int *)A_STASIS_STATE)))
             mlog("mirror: player dead flags %d %d %d dying %d", mo[0x74], mo[0xac], mo[0x154], G_PLAYER_GLIDER[GLIDER_DYING]);
     }
 }
