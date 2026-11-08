@@ -1,6 +1,6 @@
 """Build and publish a release both players install (co-op needs the same build on every PC).
 
-  python tools/release.py ["notes"]
+  python tools/release.py ["one line per fix" ...]
 
 Only from an up-to-date, clean `main`: builds the DLLs, packages dist/AIM-Coop.zip and
 dist/ClanWars-Coop.zip, tags vYYYY.MM.DD-N and creates a GitHub release with both zips and the
@@ -44,7 +44,10 @@ def main():
     run(sys.executable, os.path.join('tools', 'make_cw.py'))
     last = sorted(tags)[-1] if tags else None
     log = run('git', 'log', '--merges', '--pretty=- %s', (last + '..HEAD') if last else 'HEAD', capture=True)
-    notes = (sys.argv[1] + '\n\n' if len(sys.argv) > 1 else '') + ('Merged since %s:\n%s' % (last, log) if last else log)
+    # one line per fix, each its own argument (only the first used to reach the notes)
+    lines = [a.strip() for a in sys.argv[1:] if a.strip()]
+    head = ''.join('- %s\n' % l if len(lines) > 1 else l + '\n' for l in lines)
+    notes = (head + '\n' if head else '') + ('Merged since %s:\n%s' % (last, log) if last else log)
     notes += '\n\nBuild stamps (the `mod built` line of a log session): ' + ', '.join(
         '%s %s' % (g, stamp(os.path.join(DEV, 'build', d, 'dinput8.dll'))) for g, d in (('A.I.M.', 'aim1'), ('Clan Wars', 'aim2cw')))
     run('git', 'tag', tag)
