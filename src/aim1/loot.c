@@ -269,14 +269,54 @@ static void guest_gone(int id, int picked)
     memset(s, 0, sizeof *s);
 }
 
-// CTheThing::Run: a pickup on a guest - ours (the thing is ours to take: tell the host) or a puppet's
+#define TYPE_GLIDER  0x0e
+#define GLIDER_DYING 0x10d0       // byte: the pilot is dead - CTheThing::Run skips such gliders
+
+// the glider nearest to a thing (the log: who picked it up)
+static uint8_t *nearest_glider(const uint8_t *t, float *dist)
+{
+    uint8_t *best = NULL;
+    float bd = 1e30f;
+    const float *q = (const float *)(t + OBJ_POS);
+    for (void **nd = *(void ***)(A_OBJECT_LIST + OBJLIST_HEAD); nd; nd = (void **)nd[1]) {
+        uint8_t *o = (uint8_t *)nd[0];
+        if (!o || !o[OBJ_ALIVE] || *(int *)(o + OBJ_TYPE) != TYPE_GLIDER) continue;
+        const float *p = (const float *)(o + OBJ_POS);
+        float d = (p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) + (p[2] - q[2]) * (p[2] - q[2]);
+        if (d < bd) { bd = d; best = o; }
+    }
+    *dist = best ? sqrtf(bd) : 0;
+    return best;
+}
+
+// CTheThing::Run: a pickup on a guest - ours (the thing is ours to take: tell the host) or a puppet's.
+// On the host, the other players' gliders here are only copies, and the thing gathers every glider near it:
+// a guest's copy flying over a mechmind took it into no one's hold (the guest's own world never saw it go
+// to them), and a kill job's target was lost that way. They count as dead (+0x10d0) while a thing runs: the
+// guest picks it up in its own world, and MSG_THING_TAKEN takes it away here.
 typedef void (THISCALL *run_fn)(uint8_t *);
 static run_fn o_thing_run;
 
 static void THISCALL h_thing_run(uint8_t *t)
 {
     int was = t[THING_ACTIVE];
+    uint8_t *masked[NET_MAX_PEERS];
+    int nmask = 0;
+    if (was && net_mode() == NET_HOST) {
+        uint8_t *p;
+        for (int i = 0; nmask < NET_MAX_PEERS && (p = coop_remote_by_index(i, NULL)) != NULL; i++)
+            if (!p[GLIDER_DYING]) { p[GLIDER_DYING] = 1; masked[nmask++] = p; }
+    }
     o_thing_run(t);
+    for (int i = 0; i < nmask; i++) masked[i][GLIDER_DYING] = 0;
+    static int npicked;
+    if (was && !t[THING_ACTIVE] && net_mode() == NET_HOST && npicked++ < 30) {
+        float d;
+        uint8_t *g = nearest_glider(t, &d);
+        uint8_t *mo = g ? *(uint8_t **)(g + GLIDER_MECHANOID) : NULL;
+        mlog("loot: '%.31s' picked up here, by %.31s %.0f away", *(int *)(t + THING_NGOODS) > 0 ? (char *)t + THING_GOODS + 4 : "",
+             g == G_PLAYER_GLIDER ? "us" : mo ? (char *)mo : "?", d);
+    }
     if (!was || t[THING_ACTIVE] || net_mode() != NET_CLIENT || g_coop_menu || !G_PLAYER_GLIDER) return;
     for (int i = 0; i < MAXTHINGS; i++) {
         slot *s = &g_t[i];

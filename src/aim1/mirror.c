@@ -98,9 +98,12 @@ static int is_npc_glider(uint8_t *o)
 // the session over nothing protects them any more - the game's own CGliderObject::Damage throws
 // on the first hit (#15). Remove them while the world is still the host's.
 static void fire_reset(void);
+static char g_down_wait[NET_MAX_PEERS][32];      // players destroyed while we had no puppet / no world (#86)
+static DWORD g_down_since[NET_MAX_PEERS];
 
 void mirror_reset(void)
 {
+    memset(g_down_wait, 0, sizeof g_down_wait);
     int removed = 0;
     for (int i = 0; i < MAXNPC; i++) {
         npc *e = &g_npc[i];
@@ -275,14 +278,31 @@ void mirror_test_ai(void)
 // CGlider::Run 0x4f9b80 explodes a glider whose pilot is dead (EXP_GLIDER_2, wreck, loot) and the
 // glider leaves the object list within the frame - the 100 ms scan never saw an NPC dying, so the
 // guests only got "gone" and their copies vanished (#27). The boom goes out here, before that.
+//
+// The same frame (pilot dead, +0x10d0 still clear) drops every hold entry as things around the wreck and
+// frees the hold. In co-op a player comes back (respawn.c), so a player's hold survives the death: a guest
+// came back with its hold from its profile while the host's copy of its glider had dropped the same goods
+// (the teammate who brought the mechmind carried a second container), and the host came back with an empty
+// hold - the task it carried failed at the base. The hold stays out of that one call for players' gliders
+// (ours and the copies of the others); their mechmind still drops.
 typedef void (THISCALL *glider_run_fn)(uint8_t *);
 static glider_run_fn o_glider_run;
+#define MO_HOLD_N 0x38                  // mechanoid: hold entry count, +0x3c the entries (CGarbage at +0x34)
 
 static void THISCALL h_glider_run(uint8_t *g)
 {
+    uint8_t *pmo = glider_mechanoid(g);
+    int32_t hold[2];
+    int hidden = 0;
+    if (pmo && !g[GLIDER_DYING] && (pmo[0x74] || pmo[0xac] || pmo[0x154]) && net_mode() != NET_OFF &&
+        (g == G_PLAYER_GLIDER || coop_is_remote(g))) {
+        memcpy(hold, pmo + MO_HOLD_N, sizeof hold);
+        memset(pmo + MO_HOLD_N, 0, sizeof hold);
+        hidden = 1;
+    }
     if (net_mode() == NET_HOST && !g_coop_menu && g != G_PLAYER_GLIDER) {
         uint8_t *mo = glider_mechanoid(g);
-        if (mo && !g[0x434] && (mo[0x74] || mo[0xac] || mo[0x154]) && !coop_is_remote(g)) {
+        if (mo && !g[GLIDER_DYING] && (mo[0x74] || mo[0xac] || mo[0x154]) && !coop_is_remote(g)) {
             int gen = coop_world_gen();
             for (int i = 0; i < MAXNPC; i++) {
                 npc *e = &g_npc[i];
@@ -298,9 +318,18 @@ static void THISCALL h_glider_run(uint8_t *g)
     } else if (net_mode() == NET_CLIENT && !g_coop_menu && g != G_PLAYER_GLIDER) {
         uint8_t *mo = glider_mechanoid(g);
         static int nlog;
-        if (mo && !g[0x434] && mo[0x74] && nlog++ < 20) mlog("mirror: exploding %s here", glider_pilot(g) ? glider_pilot(g) : (char *)g + OBJ_MODEL);
+        if (mo && !g[GLIDER_DYING] && mo[0x74] && nlog++ < 20) mlog("mirror: exploding %s here", glider_pilot(g) ? glider_pilot(g) : (char *)g + OBJ_MODEL);
     }
     o_glider_run(g);
+    if (hidden) {
+        if (*(int32_t *)(pmo + MO_HOLD_N) == 0 && *(void **)(pmo + MO_HOLD_N + 4) == NULL) {
+            memcpy(pmo + MO_HOLD_N, hold, sizeof hold);
+            if (hold[0]) mlog("mirror: %s hold (%d entries) kept through the death", g == G_PLAYER_GLIDER ? "our" : "a player's",
+                              (int)hold[0]);
+        } else {
+            mlog("mirror: the hold changed in the death frame - not put back");   // the old entries leak, never freed twice
+        }
+    }
 }
 
 // g is still in the object list (alive or dying; dead gliders are freed when the list is packed)
@@ -918,7 +947,8 @@ void mirror_test_player(int hit, float dmg)
                  *(float *)(mo + k_health_off[2]), *(float *)(mo + k_health_off[3]), *(float *)(mo + k_health_off[4]));
 }
 
-// test: "puppethit" - a co-op player's puppet hits the nearest NPC (1 damage), as a replayed shot does (#20)
+// test: "puppethit <damage> [pilot]" - a co-op player's puppet hits the nearest NPC (or that pilot), as a replayed
+// shot does (#20)
 void mirror_test_hit(float dmg)
 {
     uint8_t *npc = NULL, *pup = NULL;
@@ -929,8 +959,10 @@ void mirror_test_hit(float dmg)
         if (coop_is_remote(o)) { pup = o; continue; }
         const float *p = (const float *)(o + OBJ_POS);
         float d = (p[0] - pp[0]) * (p[0] - pp[0]) + (p[1] - pp[1]) * (p[1] - pp[1]);
+        if (g_test_pilot[0]) d = glider_pilot(o) && !strcmp(glider_pilot(o), g_test_pilot) ? 0 : 1e30f;
         if (d < best) { best = d; npc = o; }
     }
+    g_test_pilot[0] = 0;
     if (!npc || !pup) { mlog("puppethit: no NPC (%p) or no player puppet (%p)", npc, pup); return; }
     const float *p = (const float *)(npc + OBJ_POS);
     mlog("puppethit: %s hit by puppet %p", (char *)npc + OBJ_MODEL, pup);
@@ -983,14 +1015,34 @@ static void player_down(const char *name)
 {
     uint8_t *g = coop_remote_glider(name);
     int peer = g ? coop_remote_peer(g) : -1;
-    if (peer < 0) { mlog("mirror: %s destroyed (no puppet here)", name); return; }
-    uint8_t *mo = glider_mechanoid(g);
     // In a base the host's world keeps running (#37): the puppet explodes there too and drops their
     // mechmind. Removed instead, it dropped none, and nobody could bring the player back.
     int world = (coop_in_flight() && !g_coop_menu) || coop_base_world_running();
-    int boom = world && mo && g[OBJ_ALIVE] && !g[GLIDER_DYING] && alive_object(g);
+    // No puppet here right now: its state went stale because our game stood still (alt-tab, a device
+    // lost) or the world doesn't run at this moment. Forgotten, the next states brought the puppet back
+    // alive with little health, it dropped no mechmind and the player stayed down for good (#86). It
+    // happens as soon as there is a puppet and a world.
+    if (peer < 0 || !world) {
+        int slot = -1;
+        for (int i = 0; i < NET_MAX_PEERS && slot < 0; i++)
+            if (!strcmp(g_down_wait[i], name)) slot = i;
+        for (int i = 0; i < NET_MAX_PEERS && slot < 0; i++)
+            if (!g_down_wait[i][0]) slot = i;
+        if (slot >= 0) {
+            if (!g_down_wait[slot][0]) mlog("mirror: %s destroyed (%s) - when it is back", name, peer < 0 ? "no puppet here" : "our world doesn't run now");
+            lstrcpynA(g_down_wait[slot], name, sizeof g_down_wait[slot]);
+            g_down_since[slot] = 0;
+        }
+        return;
+    }
+    uint8_t *mo = glider_mechanoid(g);
+    int boom = mo && g[OBJ_ALIVE] && !g[GLIDER_DYING] && alive_object(g);
     if (boom) {
         no_local_loot(g);              // a guest gets the host's drop (their mechmind) through loot.c
+        // their hold is theirs and stays with them (h_glider_run): this copy drops only the mechmind. It is
+        // no longer listed as a player's glider in its death frame (coop_remote_down below); the game frees
+        // the entries there.
+        *(int32_t *)(mo + MO_HOLD_N) = 0;
         mo[0x74] = 1;
         respawn_player_down(peer, name, g);      // the game drops their mechmind here: a teammate can bring it to a base
     }
@@ -999,6 +1051,26 @@ static void player_down(const char *name)
     char msg[96];
     snprintf(msg, sizeof msg, aim1_ui("destroyed"), name);
     coop_notify(msg);
+}
+
+// with a world running here (a flight frame or the base tick): the deaths that waited. The time starts here,
+// so a long stay in a base without a running world doesn't count.
+static void down_wait_frame(void)
+{
+    DWORD now = GetTickCount();
+    for (int i = 0; i < NET_MAX_PEERS; i++) {
+        if (!g_down_wait[i][0]) continue;
+        if (!g_down_since[i]) g_down_since[i] = now | 1;
+        char name[32];
+        lstrcpynA(name, g_down_wait[i], sizeof name);
+        if (coop_remote_glider(name)) {
+            g_down_wait[i][0] = 0;
+            player_down(name);
+        } else if (now - g_down_since[i] > 30000) {
+            g_down_wait[i][0] = 0;               // they left, or came back in another way
+            mlog("mirror: %s never came back after being destroyed", name);
+        }
+    }
 }
 
 // ---- players' health (#24) ----------------------------------------------------------------------
@@ -1195,6 +1267,7 @@ void mirror_base_frame(void)
     g_nqfire = 0;
     hold_frame();
     host_frame();
+    down_wait_frame();
     apply_player_health();
 }
 
@@ -1205,6 +1278,7 @@ void mirror_frame(void)
     if (net_mode() != NET_OFF) {
         check_own_death();
         send_player_health();
+        if (!g_coop_menu) down_wait_frame();
         apply_player_health();
         if (!g_coop_menu) hold_frame();
     }

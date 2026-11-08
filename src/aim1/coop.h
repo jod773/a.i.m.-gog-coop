@@ -35,6 +35,22 @@ int questlog_handle(int type, int from, const uint8_t *data, int len);
 void questlog_reset(void);
 void questlog_install(void);
 void questlog_test(const char *cmd, const char *arg);
+uint32_t questlog_own_bits(void);
+void questlog_set_own_bits(uint32_t bits);
+void questlog_base_frame(void);      // the host's world ticks in a base / panel
+void questlog_new_campaign(int on);  // the host's next game is a new one (#85)
+void questlog_campaign_tick(void);
+
+// cargo.c: the team's holds count as one when a script asks (#83)
+void cargo_install(void);
+void cargo_frame(void);
+void cargo_reset(void);
+int cargo_handle(int type, int from, const uint8_t *data, int len);
+int cargo_save_size(void);
+int cargo_save(uint8_t *out);
+void cargo_load(const uint8_t *b, int len, int from_guest, int from);
+int cargo_takes_waiting(void);
+void cargo_test(const char *cmd, const char *arg);
 
 // respawn.c: spectator mode for a dead player, respawn by the mechmind (#24)
 void respawn_install(void);
@@ -46,7 +62,7 @@ void respawn_frame(void);
 void respawn_base_entered(void);
 void respawn_base_frame(void);
 void respawn_reset(void);
-void respawn_test(const char *cmd);
+void respawn_test(const char *cmd, const char *pilot);
 
 // killcredit.c: a guest's kills count for the guest
 void killcredit_install(void);

@@ -13,7 +13,9 @@
 #include <string.h>
 #include <stdlib.h>
 
-enum { MSG_LOG = 40, MSG_LOG_UP = 41, MSG_SAY_ = 45 /* coop_core's notice */ };
+enum { MSG_LOG = 40, MSG_LOG_UP = 41, MSG_SAY_ = 45 /* coop_core's notice */,
+       MSG_NEXT_STOP = 59 /* char name[]: a base's next-job timer stopped */,
+       MSG_WORLD_CMD = 60 /* char token[]: a script's command that changes the world */ };
 
 #define G_SCRIPTS      (*(uint8_t **)A_TEXT_DB_PTR)
 #define SM_FLAGS       0xbd4
@@ -119,14 +121,40 @@ static void list_drop(char **l, int *n, int i)
     l[i] = l[--*n];
 }
 
+// Timers a script stopped: a delivery stops the task's timer on the player who delivered, the others' copy
+// went on, and its time-out failed the delivered task. They go out with the log and don't come back from
+// another player's. (No script starts a task's timer twice.)
+static char **g_stopped;
+static int g_nstopped;
+static char g_next_stop[8][48];      // a teammate's job finished: its base's next-job timer stops here too
+static int g_nnext_stop, g_next_remote;
+#define MAX_WORLD_CMDS 32
+static char g_world_cmd[MAX_WORLD_CMDS][128];   // a teammate's script commands that change the world
+static int g_nworld_cmd;
+
 static void removed_reset(void)
 {
     for (int i = 0; i < g_nhad; i++) free(g_had[i]);
     for (int i = 0; i < g_nremoved; i++) free(g_removed[i]);
     for (int i = 0; i < g_nmine; i++) free(g_mine[i]);
-    free(g_had); free(g_removed); free(g_mine);
-    g_had = g_removed = g_mine = NULL;
-    g_nhad = g_nremoved = g_nmine = 0;
+    for (int i = 0; i < g_nstopped; i++) free(g_stopped[i]);
+    free(g_had); free(g_removed); free(g_mine); free(g_stopped);
+    g_had = g_removed = g_mine = g_stopped = NULL;
+    g_nhad = g_nremoved = g_nmine = g_nstopped = 0;
+}
+
+// A player's own first visit (#83): base 1 asks for a name and hands out the starter kit, once, by these
+// flags. Shared, only the first player into the base got a kit. They stay each player's own, also over the
+// host's world loading on a guest (a respawn, a rejoin): kept here and in the guest's profile.
+// The game's id (#85) is a flag too, so it is saved with the game; it comes with the world, not with the log.
+#define CAMPAIGN_FLAG  "COOP_ID_"
+static const char *const g_own_flags[] = {"B1_1.NEXTPAGE", "TS_L1_NAME_CREATE.COMPLETE"};
+static uint32_t g_own_bits;
+static int g_own_gen = -1;
+
+static int personal_flag(const char *f)
+{
+    return !strcmp(f, "B1_1.NEXTPAGE") || !strncmp(f, "TS_L1_NAME_CREATE", 17) || !strncmp(f, CAMPAIGN_FLAG, 8);
 }
 
 // ---- task timers ----------------------------------------------------------------------------
@@ -146,8 +174,11 @@ static void removed_reset(void)
 #define A_NEXT_TIMER   0x00438530   // thiscall(script manager): picks the timer that runs out first
 #define WORLD_DAYS     (*(float *)0x0067661c)
 
+#define A_STOP_TIMER   0x00439dd0   // thiscall(script manager, name)
+
 typedef void (THISCALL *start_timer_fn)(void *, const char *, const char *);
 typedef void (THISCALL *void_fn)(void *);
+static str_fn o_stop_timer;
 
 static uint8_t *quest_entry(const char *name)
 {
@@ -194,7 +225,7 @@ static int task_timer(const uint8_t *t)
 }
 
 // blob: "QL1\0" u16 nq, nq * 0x54 | u16 nj, nj * 0x20 | u16 nf, nf * (u8 len, name) | u16 nr, removed names
-//       | u16 nt, nt * 0x4c task timers
+//       | u16 nt, nt * 0x4c task timers | what the players carry (cargo.c)
 static uint8_t *log_save(int *len)
 {
     uint8_t *sm = G_SCRIPTS;
@@ -232,7 +263,7 @@ static uint8_t *log_save(int *len)
     out = realloc(out, pos + need + 16);
     for (int i = 0; (f = flag_name(i, &n)) != NULL; i++) {
         int l = (int)strlen(f);
-        if (l <= 0 || l > 255) continue;
+        if (l <= 0 || l > 255 || personal_flag(f)) continue;
         out[pos++] = (uint8_t)l;
         memcpy(out + pos, f, l);
         pos += l;
@@ -261,6 +292,20 @@ static uint8_t *log_save(int *len)
     for (int i = 0; (t = timer_entry(i)) != NULL; i++)
         if (task_timer(t)) { memcpy(out + pos, t, TIMER_SIZE); pos += TIMER_SIZE; nt++; }
     *(uint16_t *)(out + tpos) = (uint16_t)nt;
+    // the task timers stopped by scripts, and what the players carry: it arrives together with the flags
+    // of the tasks (cargo.c)
+    need = 2 + cargo_save_size();
+    for (int i = 0; i < g_nstopped; i++) need += (int)strlen(g_stopped[i]) + 1;
+    out = realloc(out, pos + need);
+    *(uint16_t *)(out + pos) = (uint16_t)g_nstopped;
+    pos += 2;
+    for (int i = 0; i < g_nstopped; i++) {
+        int l = (int)strlen(g_stopped[i]);
+        out[pos++] = (uint8_t)l;
+        memcpy(out + pos, g_stopped[i], l);
+        pos += l;
+    }
+    pos += cargo_save(out + pos);
     *len = pos;
     return out;
 }
@@ -354,13 +399,31 @@ static int merge(const uint8_t *b, int len, int from_guest)
     // task timers (after the tasks and flags: a timer goes with a task we have and that still runs)
     int nt = pos + 2 <= len ? *(const uint16_t *)(b + pos) : 0, timers = 0;
     pos += 2;
+    // ... and after the stopped ones, which follow them
+    int tlist = pos, after_stops = pos + nt * TIMER_SIZE;
+    int ns = after_stops + 2 <= len ? *(const uint16_t *)(b + after_stops) : 0;
+    after_stops += 2;
+    for (int i = 0; i < ns && after_stops < len; i++) {
+        int l = b[after_stops++];
+        if (after_stops + l > len) break;
+        char name[256];
+        memcpy(name, b + after_stops, l);
+        name[l] = 0;
+        after_stops += l;
+        list_add(&g_stopped, &g_nstopped, name);
+        if (!timer_named(name)) continue;
+        o_stop_timer(sm, name);
+        mlog("questlog: timer '%s' stopped (as on player %d)", name, from_guest ? g_pending_from : 0);
+        timers++;
+    }
+    pos = tlist;
     for (int i = 0; i < nt && pos + TIMER_SIZE <= len; i++, pos += TIMER_SIZE) {
         const uint8_t *t = b + pos;
         float deadline = *(const float *)(t + TIMER_DEADLINE);
         char name[0x21];
         memcpy(name, t, 0x20);
         name[0x20] = 0;
-        if (!name[0] || !quest_entry(name) || task_over(name)) continue;
+        if (!name[0] || !quest_entry(name) || task_over(name) || in_list_of(g_stopped, g_nstopped, name) >= 0) continue;
         uint8_t *mine = timer_named(name);
         if (!mine) {
             if (deadline <= WORLD_DAYS) continue;
@@ -379,6 +442,7 @@ static int merge(const uint8_t *b, int len, int from_guest)
         timers++;
     }
     if (timers) CALL(A_NEXT_TIMER, void_fn)(sm);
+    if (after_stops < len) cargo_load(b + after_stops, len - after_stops, from_guest, g_pending_from);
     return added + timers;
 }
 
@@ -479,9 +543,61 @@ static void send_changes(int force)
     else free(b);
 }
 
+static void next_stop_frame(void);
+static void run_world_commands(void);
+static void queue_world_command(const uint8_t *data, int len);
+
+// a guest: the host's world came with the host's first-visit flags - ours go back in; what is set here is ours
+static void own_flags_frame(void)
+{
+    if (net_mode() != NET_CLIENT) return;
+    int fresh = g_own_gen != coop_world_gen();
+    g_own_gen = coop_world_gen();
+    for (int i = 0; i < (int)(sizeof g_own_flags / sizeof *g_own_flags); i++) {
+        int have = has_flag(g_own_flags[i]), mine = (g_own_bits >> i) & 1;
+        if (!fresh) { if (have) g_own_bits |= 1u << i; continue; }
+        if (have && !mine) CALL(A_REMOVE_FLAG, str_fn)(G_SCRIPTS, g_own_flags[i]);
+        if (!have && mine) CALL(A_SET_FLAG, str_fn)(G_SCRIPTS, g_own_flags[i]);
+    }
+}
+
+uint32_t questlog_own_bits(void) { return g_own_bits; }
+
+void questlog_set_own_bits(uint32_t bits) { g_own_bits = bits; g_own_gen = -1; }
+
+// ---- the game's id (#85) -----------------------------------------------------------------------
+static int g_campaign_new;
+
+void questlog_new_campaign(int on) { g_campaign_new = on; }
+
+// the host's new game gets its id at the first chance after the game started (its first base screen)
+void questlog_campaign_tick(void)
+{
+    if (!g_campaign_new || net_mode() != NET_HOST || !G_SCRIPTS) return;
+    g_campaign_new = 0;
+    char f[32];
+    snprintf(f, sizeof f, CAMPAIGN_FLAG "%08lx", (unsigned long)(GetTickCount() ^ (GetCurrentProcessId() << 16)));
+    CALL(A_SET_FLAG, str_fn)(G_SCRIPTS, f);
+    mlog("questlog: a new game: %s", f);
+}
+
+const char *cg_campaign_id(void)
+{
+    static char id[32];
+    int n;
+    const char *f;
+    questlog_campaign_tick();
+    id[0] = 0;
+    for (int i = 0; G_SCRIPTS && (f = flag_name(i, &n)) != NULL; i++)
+        if (!strncmp(f, CAMPAIGN_FLAG, 8)) { lstrcpynA(id, f + 8, sizeof id); break; }
+    return id;
+}
+
 void questlog_frame(void)
 {
     if (net_mode() == NET_OFF || !coop_in_flight()) return;
+    questlog_campaign_tick();
+    own_flags_frame();
     for (int p = 0; p < NET_MAX_PEERS; p++) {         // others' progress: merged in flight only
         if (!g_pending[p]) continue;
         // A guest's own changes first: after the merge the whole log counts as the host's (g_known),
@@ -501,7 +617,10 @@ void questlog_frame(void)
             }
         }
     }
-    send_changes(0);
+    send_changes(cargo_takes_waiting());
+    cargo_frame();
+    next_stop_frame();
+    run_world_commands();
 }
 
 void questlog_peer_joined(int peer)
@@ -513,6 +632,14 @@ void questlog_peer_joined(int peer)
 
 int questlog_handle(int type, int from, const uint8_t *data, int len)
 {
+    if (type == MSG_WORLD_CMD) {
+        queue_world_command(data, len);
+        return 1;
+    }
+    if (type == MSG_NEXT_STOP) {
+        if (len > 1 && len <= 48 && !data[len - 1] && g_nnext_stop < 8) lstrcpynA(g_next_stop[g_nnext_stop++], (const char *)data, 48);
+        return 1;
+    }
     if (type != MSG_LOG && type != MSG_LOG_UP) return 0;
     if ((type == MSG_LOG && net_mode() != NET_CLIENT) || (type == MSG_LOG_UP && net_mode() != NET_HOST)) return 1;
     if (from < 0 || from >= NET_MAX_PEERS) return 1;
@@ -534,6 +661,12 @@ void questlog_reset(void)
     g_known = 0;
     set_prev(NULL, 0);
     removed_reset();
+    cargo_reset();
+    g_own_bits = 0;
+    g_own_gen = -1;
+    g_campaign_new = 0;
+    g_nnext_stop = 0;
+    g_nworld_cmd = 0;
 }
 
 // On a joining player, tasks fail only through the host's log (#12). The guest's own copy of the
@@ -562,13 +695,55 @@ static str_fn o_remove_flag;
 
 static void THISCALL remove_flag(void *sm, const char *name)
 {
-    if (net_mode() == NET_CLIENT && !g_merging && name && sm == G_SCRIPTS && has_flag(name) &&
+    if (net_mode() == NET_CLIENT && !g_merging && name && sm == G_SCRIPTS && has_flag(name) && !personal_flag(name) &&
         in_list_of(g_mine, g_nmine, name) < 0) {
         list_add(&g_mine, &g_nmine, name);
         static int nlog;
         if (nlog++ < 40) mlog("questlog: '%s' removed here - telling the host", name);
     }
     o_remove_flag(sm, name);
+}
+
+// _STOPTIMER: a task's timer stops for everybody (see g_stopped). A base's "<base>.NEXTTASK" timer (no
+// next job from it while it runs; a finished task stops it) starts again with each job, so its stop goes out
+// once: a player whose job a teammate finished waited out the whole timer for the next one.
+static void THISCALL stop_timer(void *sm, const char *name)
+{
+    if (net_mode() != NET_OFF && !g_merging && !g_next_remote && name && sm == G_SCRIPTS) {
+        int l = (int)strlen(name);
+        if (quest_entry(name) && in_list_of(g_stopped, g_nstopped, name) < 0) {
+            list_add(&g_stopped, &g_nstopped, name);
+            mlog("questlog: timer '%s' stopped here - telling the others", name);
+        } else if (l > 9 && l < 48 && !strcmp(name + l - 9, ".NEXTTASK")) {
+            net_send(NET_ALL, MSG_NEXT_STOP, name, l + 1, 1);
+        }
+    }
+    o_stop_timer(sm, name);
+}
+
+static void next_stop_frame(void)
+{
+    for (int i = 0; i < g_nnext_stop; i++) {
+        if (!timer_named(g_next_stop[i])) continue;
+        g_next_remote = 1;
+        o_stop_timer(G_SCRIPTS, g_next_stop[i]);
+        g_next_remote = 0;
+        mlog("questlog: timer '%s' stopped (a teammate finished the job)", g_next_stop[i]);
+    }
+    g_nnext_stop = 0;
+}
+
+// _JOURNAL by a script: an entry a teammate's log already brought stays one entry
+static str_fn o_journal;
+
+static void THISCALL journal_add(void *sm, const char *id)
+{
+    if (net_mode() != NET_OFF && id && sm == G_SCRIPTS) {
+        int n = *(int *)(G_SCRIPTS + SM_JOURNAL_N);
+        const uint8_t *mine = *(uint8_t **)(G_SCRIPTS + SM_JOURNAL_P);
+        for (int k = 0; k < n; k++) if (!strncmp((const char *)mine + k * JOURNAL_SIZE, id, JOURNAL_SIZE)) return;
+    }
+    o_journal(sm, id);
 }
 
 // Dropping the guest's ".FAIL" flag left the rest of the failing script block running there - its
@@ -670,8 +845,72 @@ static int series_busy(const char *q, char *busy, int n)
     return 0;
 }
 
+// ---- script commands that change the world --------------------------------------------------------
+// Each machine runs the scripts of its own player's visit. A job's script puts its target in the world
+// (_SHOWOBJECT, ...), on the machine of the player who took the job: on a guest that was its own copy of the
+// world - the NPCs are the host's, so the target of a guest's "kill this pilot" job never existed for anyone
+// else and the job could not be done. Those commands go to the host. Sensors, map marks and clan relations are
+// everybody's: they go to all, so anyone can do the job. A token as the script has it, e.g.
+// "_SHOWOBJECT(NASP-M013)", run by the game's own parser (0x425970) and command function (vtable +0x10).
+#define A_PARSE_TOKEN  0x00425970
+#define SM_CMD_NAME    0x2ac
+#define SM_CMD_ARGS    0x2a8
+
+// 1 = the host's business, 2 = everybody's, 0 = this machine's
+static int world_command(const char *t)
+{
+    static const char *const host[] = {"_SHOWOBJECT(", "_SHOWOBJECTATPOS(", "_HIDEOBJECT(", "_SETGROUPAT(", "_STOPGROUP(",
+                                       "_ADDGROUPTOPLAYER(", "_REMOVEGROUPFROMPLAYER(", "_REANIMATE("};
+    static const char *const all[] = {"_ADDSENSOR(", "_MARK(", "_UNMARK(", "_SETORGRELATION(", "_SETORGSTDRELATION(",
+                                      "_RESTOREORGRELATION(", "_SETORGAUTORITY(", "_RESTOREORGAUTORITY("};
+    for (unsigned i = 0; i < sizeof host / sizeof *host; i++) if (!strncmp(t, host[i], strlen(host[i]))) return 1;
+    for (unsigned i = 0; i < sizeof all / sizeof *all; i++) if (!strncmp(t, all[i], strlen(all[i]))) return 2;
+    return 0;
+}
+
+static void forward_world_command(const char *t)
+{
+    int k = world_command(t), l = (int)strlen(t);
+    if (!k || l >= (int)sizeof g_world_cmd[0] || (k == 1 && net_mode() != NET_CLIENT)) return;
+    net_send(k == 1 ? 0 : NET_ALL, MSG_WORLD_CMD, t, l + 1, 1);
+    static int nlog;
+    if (nlog++ < 60) mlog("questlog: %s goes to the %s", t, k == 1 ? "host" : "others");
+}
+
+static void queue_world_command(const uint8_t *data, int len)
+{
+    if (len < 2 || len > (int)sizeof g_world_cmd[0] || data[len - 1] || g_nworld_cmd >= MAX_WORLD_CMDS) return;
+    memcpy(g_world_cmd[g_nworld_cmd++], data, len);
+}
+
+static void run_world_commands(void)
+{
+    uint8_t *sm = G_SCRIPTS;
+    if (!g_nworld_cmd || !sm) return;
+    typedef int (THISCALL *parse_fn)(uint8_t *, const char *);
+    typedef char (THISCALL *cmd_fn)(uint8_t *, const char *, void *);
+    for (int i = 0; i < g_nworld_cmd; i++) {
+        if (CALL(A_PARSE_TOKEN, parse_fn)(sm, g_world_cmd[i]) == -1) continue;
+        cmd_fn f = (*(cmd_fn **)sm)[4];
+        f(sm, (const char *)sm + SM_CMD_NAME, *(void **)(sm + SM_CMD_ARGS));
+        static int nlog;
+        if (nlog++ < 60) mlog("questlog: %s (a teammate's script)", g_world_cmd[i]);
+    }
+    g_nworld_cmd = 0;
+}
+
+// the host's world runs a tick in a base / panel (no script is running then): a guest's job can start there
+void questlog_base_frame(void)
+{
+    if (net_mode() == NET_HOST) run_world_commands();
+}
+
 static int THISCALL h_run_block(uint8_t *in, uint8_t **script)
 {
+    if (net_mode() != NET_OFF && !g_merging && script && *script) {
+        const char *t = script_tok(*script, *(int *)(in + INTER_POS));
+        if (t && t[0] == '_') forward_world_command(t);
+    }
     if (net_mode() == NET_CLIENT && !g_from_host && script && *script && G_SCRIPTS) {
         const uint8_t *l = *script;
         int pos = *(int *)(in + INTER_POS);
@@ -743,6 +982,11 @@ void questlog_install(void)
     static const uint8_t rpro[5] = {0x8b, 0x44, 0x24, 0x04, 0x56};          // mov eax, [esp+4]; push esi
     o_remove_flag = (str_fn)hook_jmp(A_REMOVE_FLAG, rpro, sizeof rpro, (void *)remove_flag);
     mlog("questlog: guests' removed flags %s", o_remove_flag ? "shared" : "NOT shared (unexpected code)");
+    static const uint8_t spro[6] = {0x83, 0xec, 0x14, 0x53, 0x8b, 0xd9};     // sub esp, 0x14; push ebx; mov ebx, ecx
+    o_stop_timer = (str_fn)hook_jmp(A_STOP_TIMER, spro, sizeof spro, (void *)stop_timer);
+    mlog("questlog: stopped task timers %s", o_stop_timer ? "shared" : "NOT shared (unexpected code)");
+    static const uint8_t jpro[5] = {0x83, 0xec, 0x2c, 0x56, 0x57};           // sub esp, 0x2c; push esi; push edi
+    o_journal = (str_fn)hook_jmp(0x00437ea0, jpro, sizeof jpro, (void *)journal_add);
 }
 
 // harness: "qldump", "qladd <quest>"
@@ -761,6 +1005,7 @@ void questlog_test(const char *cmd, const char *arg)
         char x[0x80];
         for (int i = 0; (fl = flag_name(i, &nfl)) != NULL; i++) {
             if (!strcmp(arg, "flags")) mlog("  flag %s", fl);
+            if (personal_flag(fl)) continue;              // each player's own
             snprintf(x, sizeof x, "f:%s", fl);
             set ^= hash((const uint8_t *)x, (int)strlen(x));
         }

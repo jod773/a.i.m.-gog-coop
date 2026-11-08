@@ -280,7 +280,8 @@ int cg_handle(int type, int from, const uint8_t *data, int len, const char *name
     (void)name;
     return mirror_handle(type, from, data, len) || questlog_handle(type, from, data, len) ||
            respawn_handle(type, from, data, len) || loot_handle(type, from, data, len) ||
-           killcredit_handle(type, from, data, len) || ending_handle(type, from, data, len);
+           killcredit_handle(type, from, data, len) || ending_handle(type, from, data, len) ||
+           cargo_handle(type, from, data, len);
 }
 
 void cg_frame(void)
@@ -390,6 +391,7 @@ typedef void (THISCALL *catchup_fn)(void *, float);
 static int THISCALL base_modal(void *menu, int a)
 {
     respawn_base_entered();          // mechminds we carry are delivered here
+    questlog_campaign_tick();
     g_in_base = 1;
     g_base_gen = coop_world_gen();
     g_world_ran = 0;
@@ -465,6 +467,7 @@ static void base_world_tick(void)
     if (G_PLAYER_GLIDER == pg) pg[OBJ_RUN_ON] = run_on, pg[OBJ_MOVE_ON] = move_on;
     coop_world_tick();               // the guests' gliders
     mirror_base_frame();             // the NPCs to the guests
+    questlog_base_frame();           // a guest's job puts its target in the world
     loot_base_frame();               // what was dropped meanwhile
     respawn_base_frame();            // a teammate's mechmind among it
     g_base_world = 0;
@@ -493,7 +496,6 @@ static char THISCALL menu_pump(void *app, int a)
     char r = CALL(A_DEVICE_CHECK, devcheck_fn)(app, a);
     if (g_flight_panel) coop_menu_keepalive();
     coop_show_version(G_APP && *(int *)(G_APP + APP_MODE) == 0);      // the start menu
-    if (g_modal_pump) base_world_tick();
     static int last_mode = -1;
     if (G_APP && *(int *)(G_APP + APP_MODE) != last_mode) {
         int was = last_mode;
@@ -504,7 +506,10 @@ static char THISCALL menu_pump(void *app, int a)
         }
         mlog("coop: app mode %d (quit flag %d)", last_mode, *(int *)(G_APP + 0x44));
     }
+    // The messages first: after a stall (alt-tab) the others' fresh states wait there, and the tick would
+    // take their gliders for gone (#86).
     coop_menu_poll();
+    if (g_modal_pump) base_world_tick();
     // (no journal reads here: menu loops also run while a save loads, when the quest data is rebuilt)
     return r;
 }
@@ -533,6 +538,11 @@ int cg_command(const char *cmd, const char *arg, const char *line)
     }
     if ((!strcmp(cmd, "qldump") || !strcmp(cmd, "qladd") || !strcmp(cmd, "qlflag") || !strcmp(cmd, "qlunflag") || !strcmp(cmd, "qljournal") || !strcmp(cmd, "qltimer")) && in_flight()) {
         questlog_test(cmd, arg);
+    } else if ((!strcmp(cmd, "cargostat") || !strcmp(cmd, "cargoadd")) && in_flight()) {
+        cargo_test(cmd, arg);
+    } else if (!strcmp(cmd, "fadestat")) {
+        void respawn_fade_test(void);
+        respawn_fade_test();
     } else if (!strcmp(cmd, "selfdestruct") && in_flight()) {
         G_PLAYER_MECHANOID[0x74] = 1;              // dead pilot: CGlider::Run explodes the glider
     } else if ((!strcmp(cmd, "selfhit") || !strcmp(cmd, "playerhp")) && in_flight()) {
@@ -547,7 +557,7 @@ int cg_command(const char *cmd, const char *arg, const char *line)
     } else if (!strcmp(cmd, "mapnames") && in_flight()) {
         mapmark_test();
     } else if ((!strcmp(cmd, "mindstat") || !strcmp(cmd, "pickmind")) && in_flight()) {
-        respawn_test(cmd);
+        respawn_test(cmd, arg);
     } else if (!strcmp(cmd, "gameend")) {
         ending_test(atoi(arg));
     } else if (!strcmp(cmd, "spectcam")) {
@@ -581,8 +591,11 @@ int cg_command(const char *cmd, const char *arg, const char *line)
     } else if (!strcmp(cmd, "npcai") && in_flight()) {
         void mirror_test_ai(void);
         mirror_test_ai();
-    } else if (!strcmp(cmd, "puppethit") && in_flight()) {
+    } else if (!strcmp(cmd, "puppethit") && in_flight()) {        // "puppethit <damage> [pilot]"
         void mirror_test_hit(float);
+        extern char g_test_pilot[32];
+        g_test_pilot[0] = 0;
+        sscanf(line, "%*s %*s %31s", g_test_pilot);
         mirror_test_hit((float)atof(arg));
     } else if (!strcmp(cmd, "npcs") && in_flight()) {
         // test: gliders near the player (model, position)
@@ -649,4 +662,5 @@ void aim1_coop_install(void)
     killcredit_install();
     loot_install();
     ending_install();
+    cargo_install();
 }

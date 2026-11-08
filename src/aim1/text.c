@@ -42,6 +42,7 @@ static const char *const k_text[][2] = {
     {"ql_done", "%s completed a task"},
     {"ql_failed", "%s failed a task"},
     {"ql_fail_host", "Co-op: the task is still active - only the host's game can fail it"},
+    {"cargo_taken", "%s delivered cargo from your hold"},
     {"ql_new", "%s got a new task"},
     {"ql_journal", "%s has a new journal entry"},
 };

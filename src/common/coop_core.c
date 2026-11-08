@@ -48,6 +48,7 @@ static int g_profile_test;
 static int g_my_clan;
 static uint8_t *g_profile_extra;             // restored once the host's world is up
 static int g_profile_extra_len;
+static char g_campaign[32];                  // the game being played (#85): profiles are per game, "" = per host
 static uint32_t g_player_color = 0xffffff00;
 int g_coop_menu;
 
@@ -369,8 +370,17 @@ static void send_file(int peer, const char *rel)
     fclose(f);
 }
 
+static void backup_send(int peer);
+
 static void world_send(int peer)
 {
+    // Which game this is, before the world: a new game must not bring back a player's old pilot (#85)
+    const char *campaign = cg_campaign_id();
+    if (campaign) {
+        lstrcpynA(g_campaign, campaign, sizeof g_campaign);
+        net_send(peer, MSG_CAMPAIGN, g_campaign, (int)strlen(g_campaign) + 1, 1);
+        backup_send(peer);
+    }
     cg_save_world(COOP_SYNC_SAVE);
     char rels[80][64];
     int n = 0;
@@ -464,11 +474,11 @@ static void world_receive(const netmsg *m)
 static void reset_all(void)
 {
     for (int i = 0; i < NET_MAX_PEERS; i++) forget(i);
+    g_campaign[0] = 0;
     cg_reset();
 }
 
 static void backup_store(int peer, const uint8_t *data, int len);
-static void backup_send(int peer);
 static void backup_received(const uint8_t *data, int len);
 
 static void handle(const netmsg *m)
@@ -530,9 +540,16 @@ static void handle(const netmsg *m)
             snprintf(nb, sizeof nb, cg_text("joined"), r->name);
             coop_notify(nb);
         }
-        if (first && net_mode() == NET_HOST && id > 0) backup_send(id);
+        if (first && net_mode() == NET_HOST && id > 0 && !cg_campaign_id()) backup_send(id);
         break;
     }
+    case MSG_CAMPAIGN:
+        if (net_mode() == NET_CLIENT && m->len > 0 && strncmp(g_campaign, (const char *)m->data, sizeof g_campaign - 1)) {
+            lstrcpynA(g_campaign, (const char *)m->data, m->len < (int)sizeof g_campaign ? m->len : (int)sizeof g_campaign);
+            g_profile_hash = 0;                                 // another file: the next save goes out
+            mlog("coop: the host's game is '%s'", g_campaign);
+        }
+        break;
     case MSG_PROFILE_UP:
         if (net_mode() == NET_HOST) backup_store(id, m->data, m->len);
         break;
@@ -641,7 +658,8 @@ static void profile_path(char *out, int n)
     char host[32], me[32];
     file_part(host, sizeof host, g_rem[0].name[0] ? g_rem[0].name : "host");
     file_part(me, sizeof me, g_name);
-    snprintf(out, n, "%sSAVES\\coop_%s_%s.bin", g_root, host, me);
+    if (g_campaign[0]) snprintf(out, n, "%sSAVES\\coop_%s_%s_%s.bin", g_root, host, g_campaign, me);
+    else snprintf(out, n, "%sSAVES\\coop_%s_%s.bin", g_root, host, me);
 }
 
 void coop_profile_keep(void) { g_profile_test = 1; }   // test: keep the profile file as written
@@ -696,7 +714,8 @@ static void backup_path(char *out, int n, const char *player)
 {
     char me[32];
     file_part(me, sizeof me, player);
-    snprintf(out, n, "%sSAVES\\coop_backup_%s.bin", g_root, me);
+    if (g_campaign[0]) snprintf(out, n, "%sSAVES\\coop_backup_%s_%s.bin", g_root, g_campaign, me);
+    else snprintf(out, n, "%sSAVES\\coop_backup_%s.bin", g_root, me);
 }
 
 // host: a joining player's profile as last sent, kept here
@@ -749,7 +768,7 @@ static uint8_t *profile_load(int *len)
     char p[MAX_PATH];
     profile_path(p, sizeof p);
     FILE *f = fopen(p, "rb");
-    if (!f) {                                // the single profile of earlier versions
+    if (!f && !g_campaign[0]) {              // the single profile of earlier versions
         snprintf(p, sizeof p, "%sSAVES\\coop_profile.bin", g_root);
         f = fopen(p, "rb");
     }
