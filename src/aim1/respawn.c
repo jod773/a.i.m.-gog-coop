@@ -604,6 +604,8 @@ static void THISCALL h_process_input(uint8_t *app)
     // ProcessInput reads the keys itself: an ESC can still make its death branch leave the game
     // (0x677124 = 2, 0x677120 = 1). While spectating, that is undone.
     int leave = *(int *)A_LEAVE_GAME, flag = *(uint8_t *)A_LEAVE_FLAG;
+    void mirror_stasis_frame(void);
+    mirror_stasis_frame();                        // stasis: the fast-forward only when the whole team waits
     o_process_input(app);
     void aim1_debug_after_input(void);
     aim1_debug_after_input();                     // the harness / debug menu's building entry

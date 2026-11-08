@@ -8,6 +8,8 @@
   aim1task.py kill_host      the host takes it, the guest delivers
   aim1task.py cargo_death_guest   the guest dies carrying a task's container, the host brings it back
   aim1task.py cargo_death_host    the host dies carrying it, the guest brings it back
+  aim1task.py broken         a piece shot off a glider shows on the others' copy (players both ways, an NPC)
+  aim1task.py stasis         stasis: nobody explodes; time runs faster only while every player is in stasis
 
 Each one starts its own new game. It checks outcomes, not just that both logs agree: the task must not fail, the
 cargo must reach the right hold, both players must see it completed, both must have their starter kit.
@@ -359,8 +361,83 @@ def cargo_death(who):
     subprocess.run([sys.executable, coop1.__file__, 'stop'], check=False)
 
 
+def broken():
+    """a piece shot off a glider (a wing) shows on the other players' copy too: players both ways, NPCs host -> guest"""
+    subprocess.run([sys.executable, coop1.__file__, 'start'], check=True)
+    subprocess.run([sys.executable, coop1.__file__, 'newhost'], check=True)
+    subprocess.run([sys.executable, coop1.__file__, 'join'], check=True)
+    time.sleep(3)
+    for who, piece in (('host', 0), ('guest', 1)):
+        other = 'guest' if who == 'host' else 'host'
+        s = ask(who, 'breakpiece %d' % piece)
+        print('      ' + ' '.join(l[15:] for l in s.splitlines() if 'breakpiece:' in l), flush=True)
+        time.sleep(1.5)
+        s = ask(other, 'playerhp')
+        line = [l for l in s.splitlines() if 'playerhp: %s ' % who.capitalize() in l]
+        m = re.search(r'broken ([0-9a-f]+)', line[-1]) if line else None
+        check('%s\'s copy of %s lost piece %d too' % (other, who, piece), bool(m) and int(m.group(1), 16) & (1 << piece),
+              line[-1] if line else s[-300:])
+    # an NPC near both: the host breaks it, the guest's copy follows
+    names = lambda t: set(m.group(1) for l in t.splitlines() if '(' not in l
+                          for m in [re.search(r'npcs: \S+ \S+\s+(\S+)\s+-?\d', l)] if m)
+    both = sorted(names(ask('host', 'npcs')) & names(ask('guest', 'npcs')))
+    check('an NPC both players see', bool(both), '')
+    if both:
+        s = ask('host', 'breakpiece 0 ' + both[0])
+        print('      ' + ' '.join(l[15:] for l in s.splitlines() if 'breakpiece:' in l), flush=True)
+        time.sleep(1.5)
+        s = ask('guest', 'mirrorstat')
+        line = [l for l in s.splitlines() if ' %s ' % both[0] in l]
+        m = re.search(r'broken ([0-9a-f]+)', line[-1]) if line else None
+        check('the guest\'s copy of %s lost the piece too' % both[0], bool(m) and int(m.group(1), 16) & 1, line[-1] if line else s[-300:])
+    subprocess.run([sys.executable, coop1.__file__, 'stop'], check=False)
+
+
+def stasis():
+    """stasis (the STASIS key) in co-op: nobody explodes; the world runs faster only while everyone is in stasis"""
+    subprocess.run([sys.executable, coop1.__file__, 'start'], check=True)
+    subprocess.run([sys.executable, coop1.__file__, 'newhost'], check=True)
+    subprocess.run([sys.executable, coop1.__file__, 'join'], check=True)
+    time.sleep(3)
+    ft = lambda t: [float(x) for x in re.findall(r'world speed x([0-9.]+)', t)]
+    team = lambda t: re.findall(r'team in stasis (\d)', t)
+    base_host = ft(ask('host', 'stasis'))[-1]
+    check('the world runs at normal speed to begin with', base_host == 1.0, str(base_host))
+    n_host, n_guest = log_len('host'), log_len('guest')
+    ask('guest', 'stasis in')
+    time.sleep(12)
+    s = ask('guest', 'stasis')
+    check('the guest is in stasis', 'stasis: ours 2' in s, s[-300:])
+    s = ask('host', 'stasis', 'playerhp')
+    check('the host sees the guest in stasis', re.search(r'stasis: Guest 2 ', s) is not None, s[-300:])
+    check('the guest\'s glider is still there on the host', 'playerhp: Guest' in s, s[-300:])
+    check('the host\'s time is not faster (only the guest waits)', ft(s)[-1] < base_host * 2.5, 'frame time %s vs %.4f' % (ft(s), base_host))
+    ask('host', 'stasis in')
+    time.sleep(12)
+    s = ask('host', 'stasis')
+    check('everyone in stasis: the host\'s world runs faster', team(s) and team(s)[-1] == '1' and ft(s)[-1] > base_host * 2.5,
+          s[-300:] + ' / before %.4f' % base_host)
+    ask('guest', 'stasis out')
+    time.sleep(2)
+    s = ask('host', 'stasis')
+    check('one comes out: normal time again', ft(s)[-1] < base_host * 2.5, s[-300:] + ' / before %.4f' % base_host)
+    ask('host', 'stasis out')
+    time.sleep(12)
+    for who in G:
+        s = log_since(who, n_host if who == 'host' else n_guest)
+        bad = [l for l in s.splitlines() if re.search(r'player \S+ destroyed|we were destroyed|went down|we are down', l)]
+        check('no player was destroyed on %s' % who, not bad, ' '.join(bad)[:300])
+    s = ask('host', 'playerhp')
+    check('the guest is still flying on the host', 'playerhp: Guest' in s, s[-300:])
+    subprocess.run([sys.executable, coop1.__file__, 'stop'], check=False)
+
+
 def main():
     c = sys.argv[1]
+    if c in ('broken', 'stasis'):
+        (broken if c == 'broken' else stasis)()
+        print('\n%s' % ('ALL PASSED' if not failed else 'FAILED: ' + '; '.join(failed)))
+        return 1 if failed else 0
     if c == 'cargo_death_guest':
         cargo_death('guest')
     elif c == 'cargo_death_host':
